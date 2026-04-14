@@ -1,4 +1,4 @@
-# Summarize Local Emails
+# Fetch Local Emails
 
 This project extracts recent emails directly from Thunderbird's local mail
 storage on macOS and writes them to either:
@@ -129,7 +129,7 @@ uv run pytest
 
 The project also includes:
 
-- [thunderbird_email_mcp.py](/Users/jonschre/Code/tools/summarize-local-emails/thunderbird_email_mcp.py)
+- [thunderbird_email_mcp.py](./thunderbird_email_mcp.py)
 
 Run it locally with:
 
@@ -175,7 +175,7 @@ Add this to `~/.codex/config.toml`:
 command = "uv"
 args = [
   "--directory",
-  "/Users/jonschre/Code/tools/summarize-local-emails",
+  "/PATH-TO-REPO/fetch-local-emails",
   "run",
   "python3",
   "thunderbird_email_mcp.py",
@@ -256,9 +256,9 @@ If you get permission errors:
 
 ## Files
 
-- [extract_emails.py](/Users/jonschre/Code/tools/summarize-local-emails/extract_emails.py)
+- [extract_emails.py](./extract_emails.py)
   Main script
-- [thunderbird_email_mcp.py](/Users/jonschre/Code/tools/summarize-local-emails/thunderbird_email_mcp.py)
+- [thunderbird_email_mcp.py](./thunderbird_email_mcp.py)
   MCP server wrapper for Codex
-- [pyproject.toml](/Users/jonschre/Code/tools/summarize-local-emails/pyproject.toml)
+- [pyproject.toml](./pyproject.toml)
   Minimal `uv` project config
