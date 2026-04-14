@@ -1,0 +1,22 @@
+[project]
+name = "summarize-local-emails"
+version = "0.1.0"
+description = "Local Thunderbird mailbox extractor for macOS"
+requires-python = ">=3.10"
+dependencies = [
+    "beautifulsoup4>=4.12",
+    "markdownify>=0.13",
+    "mcp",
+    "rapidfuzz>=3.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
