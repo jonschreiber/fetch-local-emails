@@ -37,12 +37,19 @@ def frozen_now(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(app, "datetime", FixedDateTime)
 
 
+def add_second_account(profile_path: Path) -> Path:
+    second_account_path = profile_path / "ImapMail" / "mail.backup.invalid"
+    shutil.copytree(profile_path / "ImapMail" / "mail.example.invalid", second_account_path)
+    return second_account_path
+
+
 def test_extract_emails_filters_date_and_decodes_content(
     fixture_profile: Path,
     frozen_now: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(app, "RUNTIME_PROFILE_OVERRIDE", "")
+    monkeypatch.setattr(app, "RUNTIME_ACCOUNT_OVERRIDE", "")
     mbox_path = app.find_mbox_path(fixture_profile, "INBOX")
 
     emails = app.extract_emails(mbox_path, days_back=7, max_body=1000)
@@ -76,7 +83,8 @@ def test_run_extraction_returns_profile_mbox_and_stats(
     )
 
     assert result.profile_path == fixture_profile
-    assert result.mbox_path == fixture_profile / "ImapMail" / "outlook.office365.com" / "INBOX"
+    assert result.account_path == fixture_profile / "ImapMail" / "mail.example.invalid"
+    assert result.mbox_path == fixture_profile / "ImapMail" / "mail.example.invalid" / "INBOX"
     assert result.stats.total_in_mbox == 4
     assert result.stats.matched_in_range == 2
     assert result.stats.matched_after_filters == 2
@@ -89,6 +97,7 @@ def test_extract_emails_filters_by_partial_sender(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(app, "RUNTIME_PROFILE_OVERRIDE", "")
+    monkeypatch.setattr(app, "RUNTIME_ACCOUNT_OVERRIDE", "")
     mbox_path = app.find_mbox_path(fixture_profile, "INBOX")
 
     emails = app.extract_emails(mbox_path, days_back=7, max_body=1000, sender_filter="@zoom.us")
@@ -106,6 +115,7 @@ def test_extract_emails_filters_by_fuzzy_subject(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(app, "RUNTIME_PROFILE_OVERRIDE", "")
+    monkeypatch.setattr(app, "RUNTIME_ACCOUNT_OVERRIDE", "")
     mbox_path = app.find_mbox_path(fixture_profile, "INBOX")
 
     emails = app.extract_emails(mbox_path, days_back=7, max_body=1000, subject_filter="meetng assets")
@@ -257,6 +267,55 @@ def test_find_thunderbird_profile_auto_detects_first_profile(
     assert app.find_thunderbird_profile() == first_profile
 
 
+def test_discover_mail_accounts_lists_profile_accounts(fixture_profile: Path) -> None:
+    accounts = app.discover_mail_accounts(fixture_profile)
+
+    assert accounts == [
+        app.MailAccount(
+            profile_path=fixture_profile,
+            account_path=fixture_profile / "ImapMail" / "mail.example.invalid",
+            storage_root="ImapMail",
+            account_name="mail.example.invalid",
+        )
+    ]
+
+
+def test_find_mbox_path_requires_account_when_multiple_accounts(
+    fixture_profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    add_second_account(fixture_profile)
+    monkeypatch.setattr(app, "RUNTIME_ACCOUNT_OVERRIDE", "")
+
+    with pytest.raises(ValueError, match="Multiple Thunderbird mail accounts were found"):
+        app.find_mbox_path(fixture_profile, "INBOX")
+
+
+def test_find_mbox_path_uses_selected_account(
+    fixture_profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    second_account_path = add_second_account(fixture_profile)
+    monkeypatch.setattr(app, "RUNTIME_ACCOUNT_OVERRIDE", "mail.backup.invalid")
+
+    assert app.find_mbox_path(fixture_profile, "INBOX") == second_account_path / "INBOX"
+
+
+def test_render_account_discovery_includes_accounts(fixture_profile: Path) -> None:
+    add_second_account(fixture_profile)
+
+    rendered = app.render_account_discovery(
+        fixture_profile,
+        app.discover_mail_accounts(fixture_profile),
+    )
+
+    assert f"Thunderbird profile: {fixture_profile}" in rendered
+    assert "- mail.backup.invalid (ImapMail)" in rendered
+    assert "- mail.example.invalid (ImapMail)" in rendered
+    assert "--list-accounts" not in rendered
+    assert "--account <account-name>" in rendered
+
+
 def test_render_markdown_and_write_markdown(
     fixture_profile: Path,
     frozen_now: None,
@@ -308,7 +367,7 @@ def test_run_extraction_raises_for_empty_mailbox(
     tmp_path: Path,
 ) -> None:
     profile_path = tmp_path / "empty.default-release"
-    mbox_root = profile_path / "ImapMail" / "outlook.office365.com"
+    mbox_root = profile_path / "ImapMail" / "mail.example.invalid"
     mbox_root.mkdir(parents=True)
     (mbox_root / "INBOX").touch()
 
@@ -322,3 +381,42 @@ def test_run_extraction_raises_for_empty_mailbox(
                 thunderbird_profile=str(profile_path),
             )
         )
+
+
+def test_run_extraction_requires_account_when_multiple_accounts(
+    fixture_profile: Path,
+    frozen_now: None,
+) -> None:
+    add_second_account(fixture_profile)
+
+    with pytest.raises(ValueError, match="Multiple Thunderbird mail accounts were found"):
+        app.run_extraction(
+            app.Config(
+                days_back=7,
+                mail_folder="INBOX",
+                output_file="~/emails_last_week.md",
+                max_body_length=1000,
+                thunderbird_profile=str(fixture_profile),
+            )
+        )
+
+
+def test_run_extraction_uses_requested_account_when_multiple_accounts(
+    fixture_profile: Path,
+    frozen_now: None,
+) -> None:
+    second_account_path = add_second_account(fixture_profile)
+
+    result = app.run_extraction(
+        app.Config(
+            days_back=7,
+            mail_folder="INBOX",
+            output_file="~/emails_last_week.md",
+            max_body_length=1000,
+            thunderbird_profile=str(fixture_profile),
+            thunderbird_account="mail.backup.invalid",
+        )
+    )
+
+    assert result.account_path == second_account_path
+    assert result.mbox_path == second_account_path / "INBOX"

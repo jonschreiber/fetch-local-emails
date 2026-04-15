@@ -76,6 +76,10 @@ def build_tools() -> list[types.Tool]:
                         "type": "string",
                         "description": "Optional Thunderbird profile path override.",
                     },
+                    "account": {
+                        "type": "string",
+                        "description": "Optional Thunderbird account directory name inside ImapMail/ or Mail/. Use `extract_emails.py --list-accounts` to discover values.",
+                    },
                     "sender": {
                         "type": "string",
                         "description": 'Optional case-insensitive sender filter. Partial matches are supported, for example "@zoom.us".',
@@ -149,6 +153,7 @@ def build_config(arguments: dict[str, Any] | None) -> tuple[Config, str, bool]:
         output_file=_validate_optional_str(raw_arguments, "output_file", "~/emails_last_week.md"),
         max_body_length=_validate_optional_int(raw_arguments, "max_body", 1000),
         thunderbird_profile=_validate_optional_str(raw_arguments, "profile", ""),
+        thunderbird_account=_validate_optional_str(raw_arguments, "account", ""),
         sender_filter=_validate_optional_str(raw_arguments, "sender", ""),
         subject_filter=_validate_optional_str(raw_arguments, "subject", ""),
         body_mode=_validate_optional_str(raw_arguments, "body_mode", "rendered"),
@@ -171,6 +176,7 @@ def build_markdown_payload(config: Config, write_to_file: bool) -> dict[str, obj
     return {
         "format": "markdown",
         "profile_path": str(result.profile_path),
+        "account_path": str(result.account_path),
         "mbox_path": str(result.mbox_path),
         "stats": {
             "total_in_mbox": result.stats.total_in_mbox,
@@ -190,6 +196,7 @@ def build_json_payload(config: Config) -> dict[str, object]:
     return {
         "format": "json",
         "profile_path": str(result.profile_path),
+        "account_path": str(result.account_path),
         "mbox_path": str(result.mbox_path),
         "stats": {
             "total_in_mbox": result.stats.total_in_mbox,

@@ -3,9 +3,9 @@
 Extract recent emails directly from Thunderbird's local mbox storage on macOS.
 
 This script finds your Thunderbird profile, opens a local mbox file such as
-`INBOX`, extracts recent messages, optionally filters them by sender and subject,
-and writes them as either Markdown or JSON. It works whether Thunderbird is
-open or closed.
+`INBOX`, extracts recent messages, optionally filters them by sender and
+subject, and writes them as either Markdown or JSON. It works whether
+Thunderbird is open or closed.
 
 Prerequisites:
 - `python3`
@@ -14,6 +14,8 @@ Prerequisites:
 
 Usage examples:
     python3 extract_emails.py
+    python3 extract_emails.py --list-accounts
+    python3 extract_emails.py --account mail.example.invalid
     python3 extract_emails.py --days 3 --json
     python3 extract_emails.py --folder Sent --output ~/sent.md
     python3 extract_emails.py --sender @zoom.us --subject "Meeting assets"
@@ -25,7 +27,7 @@ How to find your Thunderbird profile manually if auto-detect fails:
 - Open `~/Library/Thunderbird/Profiles/`
 - Look for a profile directory such as `xxxx.default-release`
 - Inside that directory, confirm you have:
-  `ImapMail/outlook.office365.com/INBOX`
+  `ImapMail/<account>/INBOX` or `Mail/<account>/INBOX`
 - Pass the profile directory with `--profile /path/to/profile`
 
 Note:
@@ -59,6 +61,7 @@ MAIL_FOLDER = "INBOX"
 OUTPUT_FILE = "~/emails_last_week.md"
 MAX_BODY_LENGTH = 1000
 THUNDERBIRD_PROFILE = ""
+THUNDERBIRD_ACCOUNT = ""
 SENDER_FILTER = ""
 SUBJECT_FILTER = ""
 BODY_MODE = "rendered"
@@ -66,9 +69,9 @@ BODY_MODE = "rendered"
 SUBJECT_FUZZY_THRESHOLD: Final[int] = 80
 HTML_STRIP_TAGS: Final[list[str]] = ["script", "style"]
 VALID_BODY_MODES: Final[set[str]] = {"rendered", "both"}
-
-EXPECTED_PROFILE_GLOB: Final[str] = "~/Library/Thunderbird/Profiles/*/ImapMail/outlook.office365.com"
-EXPECTED_PROFILE_HINT: Final[str] = "~/Library/Thunderbird/Profiles/*/ImapMail/outlook.office365.com/"
+MAIL_STORAGE_DIRECTORIES: Final[tuple[str, ...]] = ("ImapMail", "Mail")
+EXPECTED_PROFILE_HINT: Final[str] = "~/Library/Thunderbird/Profiles/*/{ImapMail,Mail}/<account>/"
+DISCOVERY_COMMAND_HINT: Final[str] = "uv run python3 extract_emails.py --list-accounts"
 
 
 @dataclass(frozen=True)
@@ -80,10 +83,12 @@ class Config:
     output_file: str = OUTPUT_FILE
     max_body_length: int = MAX_BODY_LENGTH
     thunderbird_profile: str = THUNDERBIRD_PROFILE
+    thunderbird_account: str = THUNDERBIRD_ACCOUNT
     sender_filter: str = SENDER_FILTER
     subject_filter: str = SUBJECT_FILTER
     body_mode: str = BODY_MODE
     as_json: bool = False
+    list_accounts: bool = False
 
 
 @dataclass
@@ -101,12 +106,24 @@ class ExtractionResult:
     """The extracted emails plus metadata about the mailbox that was used."""
 
     profile_path: Path
+    account_path: Path
     mbox_path: Path
     emails: list[dict[str, str]]
     stats: ExtractionStats
 
 
+@dataclass(frozen=True)
+class MailAccount:
+    """A discoverable Thunderbird mail account directory."""
+
+    profile_path: Path
+    account_path: Path
+    storage_root: str
+    account_name: str
+
+
 RUNTIME_PROFILE_OVERRIDE = THUNDERBIRD_PROFILE
+RUNTIME_ACCOUNT_OVERRIDE = THUNDERBIRD_ACCOUNT
 LAST_EXTRACTION_STATS = ExtractionStats()
 
 
@@ -114,6 +131,101 @@ def eprint(message: str) -> None:
     """Print a message to stderr."""
 
     print(message, file=sys.stderr)
+
+
+def is_mail_account_path(path: Path) -> bool:
+    """Return true when the path points at a Thunderbird account directory."""
+
+    return path.is_dir() and path.parent.name in MAIL_STORAGE_DIRECTORIES
+
+
+def discover_mail_accounts(profile: Path) -> list[MailAccount]:
+    """Return the discoverable Thunderbird mail accounts for a profile."""
+
+    profile_path = profile.expanduser()
+    account_paths: list[Path] = []
+
+    if is_mail_account_path(profile_path):
+        base_profile = profile_path.parent.parent
+        account_paths = [profile_path]
+    elif profile_path.name in MAIL_STORAGE_DIRECTORIES and profile_path.is_dir():
+        base_profile = profile_path.parent
+        account_paths = sorted(path for path in profile_path.iterdir() if path.is_dir())
+    else:
+        base_profile = profile_path
+        for storage_root in MAIL_STORAGE_DIRECTORIES:
+            storage_path = profile_path / storage_root
+            if not storage_path.exists():
+                continue
+            account_paths.extend(sorted(path for path in storage_path.iterdir() if path.is_dir()))
+
+    return [
+        MailAccount(
+            profile_path=base_profile,
+            account_path=account_path,
+            storage_root=account_path.parent.name,
+            account_name=account_path.name,
+        )
+        for account_path in account_paths
+    ]
+
+
+def render_account_discovery(profile: Path, accounts: list[MailAccount]) -> str:
+    """Render a plain-text list of discoverable Thunderbird accounts."""
+
+    lines = [
+        f"Thunderbird profile: {profile}",
+        "",
+        "Available mail accounts:",
+    ]
+    for account in accounts:
+        lines.append(f"- {account.account_name} ({account.storage_root})")
+    lines.extend(
+        [
+            "",
+            "Use one with:",
+            "  uv run python3 extract_emails.py --account <account-name>",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def resolve_mail_account(profile: Path, requested_account: str = "") -> MailAccount:
+    """Resolve the Thunderbird account directory to use for extraction."""
+
+    accounts = discover_mail_accounts(profile)
+    if not accounts:
+        raise FileNotFoundError(
+            f"Thunderbird mail accounts were not found under {profile}. Expected a path like "
+            f"{EXPECTED_PROFILE_HINT} Run `{DISCOVERY_COMMAND_HINT}` after syncing a mailbox."
+        )
+
+    normalized_requested = requested_account.strip().casefold()
+    if not normalized_requested:
+        if len(accounts) == 1:
+            return accounts[0]
+        available_accounts = ", ".join(
+            f"{account.account_name} ({account.storage_root})" for account in accounts
+        )
+        raise ValueError(
+            f"Multiple Thunderbird mail accounts were found under {accounts[0].profile_path}. "
+            f"Run `{DISCOVERY_COMMAND_HINT}` and rerun with `--account <name>`. "
+            f"Available accounts: {available_accounts}"
+        )
+
+    matches = [
+        account for account in accounts if account.account_name.strip().casefold() == normalized_requested
+    ]
+    if len(matches) == 1:
+        return matches[0]
+
+    available_accounts = ", ".join(
+        f"{account.account_name} ({account.storage_root})" for account in accounts
+    )
+    raise ValueError(
+        f"Thunderbird account '{requested_account}' was not found under {accounts[0].profile_path}. "
+        f"Available accounts: {available_accounts}. Run `{DISCOVERY_COMMAND_HINT}` to inspect available accounts."
+    )
 
 
 def find_thunderbird_profile() -> Path:
@@ -124,39 +236,38 @@ def find_thunderbird_profile() -> Path:
         if not override_path.exists():
             raise FileNotFoundError(
                 f"Thunderbird profile override was not found: {override_path}. "
-                f"Expected a profile containing ImapMail/outlook.office365.com/."
+                f"Expected a profile or account path like {EXPECTED_PROFILE_HINT}"
             )
-        if override_path.name == "outlook.office365.com" and override_path.parent.name == "ImapMail":
+        if is_mail_account_path(override_path):
             return override_path.parent.parent
-        return override_path
+        if override_path.name in MAIL_STORAGE_DIRECTORIES and override_path.is_dir():
+            return override_path.parent
+        if discover_mail_accounts(override_path):
+            return override_path
+        raise FileNotFoundError(
+            f"Thunderbird profile override is not a profile or account path: {override_path}. "
+            f"Expected a path like {EXPECTED_PROFILE_HINT}"
+        )
 
     profiles_root = Path.home() / "Library" / "Thunderbird" / "Profiles"
-    candidates = sorted(profiles_root.glob("*/ImapMail/outlook.office365.com*"))
+    candidates = sorted(
+        profile_path
+        for profile_path in profiles_root.glob("*")
+        if profile_path.is_dir() and discover_mail_accounts(profile_path)
+    )
     if not candidates:
         raise FileNotFoundError(
             "Thunderbird profile not found. Expected a path like "
-            f"{EXPECTED_PROFILE_HINT}"
+            f"{EXPECTED_PROFILE_HINT} Run `{DISCOVERY_COMMAND_HINT}` after syncing a mailbox."
         )
-    return candidates[0].parent.parent
+    return candidates[0]
 
 
 def find_mbox_path(profile: Path, folder: str) -> Path:
     """Resolve the Thunderbird mbox path for the selected folder."""
 
-    profile_path = profile.expanduser()
-    if profile_path.name == "outlook.office365.com" and profile_path.parent.name == "ImapMail":
-        imap_root = profile_path
-    else:
-        candidate_roots = sorted((profile_path / "ImapMail").glob("outlook.office365.com*"))
-        imap_root = candidate_roots[0] if candidate_roots else profile_path / "ImapMail" / "outlook.office365.com"
-
-    if not imap_root.exists():
-        raise FileNotFoundError(
-            f"Thunderbird IMAP mail directory was not found under {profile_path}. "
-            "Expected ImapMail/outlook.office365.com/."
-        )
-
-    mbox_path = imap_root / folder
+    account = resolve_mail_account(profile.expanduser(), RUNTIME_ACCOUNT_OVERRIDE)
+    mbox_path = account.account_path / folder
     if not mbox_path.exists():
         raise FileNotFoundError(
             f"The Thunderbird mail file {mbox_path} was not found. "
@@ -560,6 +671,11 @@ def parse_args() -> Config:
     parser.add_argument("--output", default=OUTPUT_FILE, help="Markdown output path. Default: ~/emails_last_week.md")
     parser.add_argument("--max-body", type=int, default=MAX_BODY_LENGTH, help="Maximum body length. Default: 1000.")
     parser.add_argument(
+        "--account",
+        default=THUNDERBIRD_ACCOUNT,
+        help="Thunderbird account directory name inside ImapMail/ or Mail/. Use --list-accounts to discover values.",
+    )
+    parser.add_argument(
         "--sender",
         default=SENDER_FILTER,
         help='Optional case-insensitive sender filter. Partial matches are supported, for example "@zoom.us".',
@@ -581,6 +697,11 @@ def parse_args() -> Config:
         help="Thunderbird profile path override. Default: auto-detect.",
     )
     parser.add_argument(
+        "--list-accounts",
+        action="store_true",
+        help="List discoverable Thunderbird mail accounts for the selected profile and exit.",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Write JSON to stdout instead of Markdown.",
@@ -593,10 +714,12 @@ def parse_args() -> Config:
         output_file=args.output,
         max_body_length=args.max_body,
         thunderbird_profile=args.profile,
+        thunderbird_account=args.account,
         sender_filter=args.sender,
         subject_filter=args.subject,
         body_mode=args.body_mode,
         as_json=args.json,
+        list_accounts=args.list_accounts,
     )
 
 
@@ -621,9 +744,11 @@ def validate_config(config: Config) -> Config:
         mail_folder=mail_folder,
         output_file=output_file,
         thunderbird_profile=config.thunderbird_profile.strip(),
+        thunderbird_account=config.thunderbird_account.strip(),
         sender_filter=config.sender_filter.strip(),
         subject_filter=config.subject_filter.strip(),
         body_mode=body_mode,
+        list_accounts=config.list_accounts,
     )
 
 
@@ -656,12 +781,14 @@ def render_markdown(emails: list[dict[str, str]]) -> str:
 def run_extraction(config: Config) -> ExtractionResult:
     """Run the full extraction workflow and return emails plus mailbox metadata."""
 
-    global RUNTIME_PROFILE_OVERRIDE
+    global RUNTIME_PROFILE_OVERRIDE, RUNTIME_ACCOUNT_OVERRIDE
 
     validated = validate_config(config)
     RUNTIME_PROFILE_OVERRIDE = validated.thunderbird_profile
+    RUNTIME_ACCOUNT_OVERRIDE = validated.thunderbird_account
 
     profile_path = find_thunderbird_profile()
+    account = resolve_mail_account(profile_path, validated.thunderbird_account)
     mbox_path = find_mbox_path(profile_path, validated.mail_folder)
 
     try:
@@ -690,6 +817,7 @@ def run_extraction(config: Config) -> ExtractionResult:
 
     return ExtractionResult(
         profile_path=profile_path,
+        account_path=account.account_path,
         mbox_path=mbox_path,
         emails=emails,
         stats=ExtractionStats(
@@ -706,10 +834,19 @@ def main() -> None:
 
     try:
         config = validate_config(parse_args())
+        if config.list_accounts:
+            global RUNTIME_PROFILE_OVERRIDE, RUNTIME_ACCOUNT_OVERRIDE
+            RUNTIME_PROFILE_OVERRIDE = config.thunderbird_profile
+            RUNTIME_ACCOUNT_OVERRIDE = ""
+            profile_path = find_thunderbird_profile()
+            print(render_account_discovery(profile_path, discover_mail_accounts(profile_path)), end="")
+            return
+
         result = run_extraction(config)
         output_path = Path(config.output_file).expanduser()
         has_content_filters = bool(config.sender_filter.strip() or config.subject_filter.strip())
 
+        eprint(f"Thunderbird account path: {result.account_path}")
         eprint(f"Emails found in mbox: {result.stats.total_in_mbox}")
         eprint(f"Emails matching date filter: {result.stats.matched_in_range}")
         if has_content_filters:

@@ -40,15 +40,22 @@ line breaks, and tables is retained more cleanly. Long bodies are truncated.
 This project is set up so you can run it with `uv`. The runtime dependencies are
 small: `mcp` for the server wrapper and `rapidfuzz` for fuzzy subject matching.
 
-## How Profile Detection Works
+## How Account Detection Works
 
-By default the script looks for the first Thunderbird profile matching:
+By default the script:
 
-```text
-~/Library/Thunderbird/Profiles/*/ImapMail/outlook.office365.com/
+- finds the first Thunderbird profile under `~/Library/Thunderbird/Profiles/`
+- looks for mail account directories under `ImapMail/` and `Mail/`
+- uses the only available account automatically
+- asks you to choose `--account` when multiple accounts are present
+
+To inspect the available account names for the selected profile, run:
+
+```bash
+uv run python3 extract_emails.py --list-accounts
 ```
 
-If auto-detect fails, you can point it at a profile manually with `--profile`.
+If auto-detect picks the wrong profile, point it at a profile manually with `--profile`.
 
 ## How To Run
 
@@ -61,11 +68,24 @@ uv run python3 extract_emails.py
 That will:
 
 - auto-detect the Thunderbird profile
+- auto-detect the Thunderbird account when only one is available
 - read the `INBOX` mbox file
 - extract emails from the last 7 days
 - write Markdown to `~/emails_last_week.md`
 
 ## Common Examples
+
+List discoverable Thunderbird mail accounts:
+
+```bash
+uv run python3 extract_emails.py --list-accounts
+```
+
+Extract from a specific Thunderbird account:
+
+```bash
+uv run python3 extract_emails.py --account mail.example.invalid
+```
 
 Extract the last 7 days to Markdown:
 
@@ -115,6 +135,12 @@ Use a specific Thunderbird profile:
 uv run python3 extract_emails.py --profile /path/to/Thunderbird/Profile
 ```
 
+Use a specific Thunderbird profile and account:
+
+```bash
+uv run python3 extract_emails.py --profile /path/to/Thunderbird/Profile --account mail.example.invalid
+```
+
 ## Running Tests
 
 The project includes `pytest` tests against a Thunderbird-style mailbox fixture.
@@ -147,6 +173,7 @@ Tool inputs:
 - `folder`
 - `max_body`
 - `profile`
+- `account`
 - `format`
   `markdown` or `json`
 - `sender`
@@ -175,7 +202,7 @@ Add this to `~/.codex/config.toml`:
 command = "uv"
 args = [
   "--directory",
-  "/PATH-TO-REPO/fetch-local-emails",
+  "/path/to/fetch-local-emails",
   "run",
   "python3",
   "thunderbird_email_mcp.py",
@@ -196,6 +223,10 @@ tool_timeout_sec = 300
   Maximum body length per email. Default: `1000`
 - `--profile`
   Thunderbird profile path override
+- `--account`
+  Thunderbird account directory name inside `ImapMail/` or `Mail/`
+- `--list-accounts`
+  List discoverable Thunderbird mail accounts and exit
 - `--sender`
   Optional case-insensitive sender filter with partial matches
 - `--subject`
@@ -236,8 +267,13 @@ With `--body-mode both`, each JSON object also includes:
 If the Thunderbird profile is not found:
 
 - check `~/Library/Thunderbird/Profiles/`
-- confirm the profile contains `ImapMail/YOUR-MAIL-SERVER-HERE/`
+- confirm the profile contains `ImapMail/<account>/` or `Mail/<account>/`
 - rerun with `--profile /path/to/profile`
+
+If multiple Thunderbird accounts are present:
+
+- run `uv run python3 extract_emails.py --list-accounts`
+- rerun with `--account <account-name>`
 
 If the mailbox file is missing:
 
