@@ -39,6 +39,7 @@ Note:
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import mailbox
 import re
@@ -99,6 +100,8 @@ class Config:
 
     days_back: int = DAYS_BACK
     mail_folder: str = MAIL_FOLDER
+    mail_folder_globs: tuple[str, ...] = ()
+    recursive_folders: bool = False
     output_file: str = OUTPUT_FILE
     max_body_length: int = MAX_BODY_LENGTH
     thunderbird_profile: str = THUNDERBIRD_PROFILE
@@ -127,6 +130,7 @@ class ExtractionResult:
     profile_path: Path
     account_path: Path
     mbox_path: Path
+    mbox_paths: list[Path]
     emails: list[dict[str, str]]
     stats: ExtractionStats
 
@@ -282,17 +286,111 @@ def find_thunderbird_profile() -> Path:
     return candidates[0]
 
 
-def find_mbox_path(profile: Path, folder: str) -> Path:
-    """Resolve the Thunderbird mbox path for the selected folder."""
+def is_mailbox_file(path: Path) -> bool:
+    """Return true when the path looks like a Thunderbird mbox folder file."""
+
+    if not path.is_file():
+        return False
+    if path.name.startswith("."):
+        return False
+    if path.name.endswith(".msf") or path.name.endswith(".dat") or path.name.endswith(".sqlite"):
+        return False
+    return path.suffix not in {".sbd", ".mozmsgs"}
+
+
+def resolve_nested_mail_folder(account_path: Path, folder: str) -> Path:
+    """Resolve a possibly nested Thunderbird folder path like `Foo/Bar/Baz`."""
+
+    parts = [part for part in Path(folder).parts if part not in {"", "."}]
+    if not parts:
+        raise ValueError("--folder must not be empty.")
+
+    current_parent = account_path
+    current_path = current_parent / parts[0]
+    for part in parts[1:]:
+        current_parent = current_path.with_name(f"{current_path.name}.sbd")
+        current_path = current_parent / part
+    return current_path
+
+
+def iter_descendant_mailboxes(folder_path: Path) -> list[Path]:
+    """Return mailbox files under the folder's `.sbd` directory, recursively."""
+
+    descendants: list[Path] = []
+    root = folder_path.with_name(f"{folder_path.name}.sbd")
+    if not root.is_dir():
+        return descendants
+
+    def walk(directory: Path) -> None:
+        if not directory.is_dir():
+            return
+        for child in sorted(directory.iterdir()):
+            if is_mailbox_file(child):
+                descendants.append(child)
+                walk(child.with_name(f"{child.name}.sbd"))
+
+    walk(root)
+    return descendants
+
+
+def dedupe_paths(paths: list[Path]) -> list[Path]:
+    """Return paths in first-seen order without duplicates."""
+
+    seen: set[Path] = set()
+    deduped: list[Path] = []
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        deduped.append(path)
+    return deduped
+
+
+def find_mbox_paths(
+    profile: Path,
+    folder: str,
+    folder_globs: tuple[str, ...] = (),
+    recursive: bool = False,
+) -> list[Path]:
+    """Resolve one or more Thunderbird mbox files for extraction."""
 
     account = resolve_mail_account(profile.expanduser(), RUNTIME_ACCOUNT_OVERRIDE)
-    mbox_path = account.account_path / folder
+
+    if folder_globs:
+        matched_paths: list[Path] = []
+        for child in sorted(account.account_path.iterdir()):
+            if not is_mailbox_file(child):
+                continue
+            if not any(fnmatch.fnmatch(child.name, pattern) for pattern in folder_globs):
+                continue
+            matched_paths.append(child)
+            if recursive:
+                matched_paths.extend(iter_descendant_mailboxes(child))
+        if not matched_paths:
+            patterns = ", ".join(folder_globs)
+            raise FileNotFoundError(
+                f"No Thunderbird mail folders under {account.account_path} matched: {patterns}. "
+                "Open Thunderbird, click the target folders so they sync locally, then try again."
+            )
+        return dedupe_paths(matched_paths)
+
+    mbox_path = resolve_nested_mail_folder(account.account_path, folder)
     if not mbox_path.exists():
         raise FileNotFoundError(
             f"The Thunderbird mail file {mbox_path} was not found. "
             "Open Thunderbird, click the target folder so it syncs locally, then try again."
         )
-    return mbox_path
+
+    resolved_paths = [mbox_path]
+    if recursive:
+        resolved_paths.extend(iter_descendant_mailboxes(mbox_path))
+    return dedupe_paths(resolved_paths)
+
+
+def find_mbox_path(profile: Path, folder: str) -> Path:
+    """Resolve a single Thunderbird mbox path for backward-compatible callers."""
+
+    return find_mbox_paths(profile, folder)[0]
 
 
 def decode_header_value(raw: str | None) -> str:
@@ -701,6 +799,45 @@ def extract_emails(
     return extracted
 
 
+def extract_emails_from_mboxes(
+    mbox_paths: list[Path],
+    days_back: int,
+    max_body: int,
+    sender_filter: str = "",
+    subject_filter: str = "",
+    body_mode: str = BODY_MODE,
+) -> list[dict[str, str]]:
+    """Extract emails from multiple Thunderbird mbox files."""
+
+    global LAST_EXTRACTION_STATS
+    aggregate_stats = ExtractionStats()
+
+    extracted: list[dict[str, str]] = []
+    for mbox_path in mbox_paths:
+        emails = extract_emails(
+            mbox_path,
+            days_back,
+            max_body,
+            sender_filter=sender_filter,
+            subject_filter=subject_filter,
+            body_mode=body_mode,
+        )
+        extracted.extend(emails)
+        aggregate_stats = ExtractionStats(
+            total_in_mbox=aggregate_stats.total_in_mbox + LAST_EXTRACTION_STATS.total_in_mbox,
+            matched_in_range=aggregate_stats.matched_in_range + LAST_EXTRACTION_STATS.matched_in_range,
+            matched_after_filters=aggregate_stats.matched_after_filters + LAST_EXTRACTION_STATS.matched_after_filters,
+            skipped_malformed=aggregate_stats.skipped_malformed + LAST_EXTRACTION_STATS.skipped_malformed,
+        )
+    LAST_EXTRACTION_STATS = ExtractionStats(
+        total_in_mbox=aggregate_stats.total_in_mbox,
+        matched_in_range=aggregate_stats.matched_in_range,
+        matched_after_filters=len(extracted),
+        skipped_malformed=aggregate_stats.skipped_malformed,
+    )
+    return extracted
+
+
 def write_markdown(emails: list[dict[str, str]], output_path: Path) -> None:
     """Write extracted emails to a Markdown file."""
 
@@ -725,6 +862,20 @@ def parse_args() -> Config:
     )
     parser.add_argument("--days", type=int, default=DAYS_BACK, help="Days back to include. Default: 7.")
     parser.add_argument("--folder", default=MAIL_FOLDER, help='Mailbox filename. Default: "INBOX".')
+    parser.add_argument(
+        "--folder-glob",
+        action="append",
+        default=[],
+        help=(
+            "Optional shell-style pattern for matching top-level Thunderbird folders, "
+            'for example "1*", "A1", or "1?.*". Repeat to include multiple patterns.'
+        ),
+    )
+    parser.add_argument(
+        "--recursive-folders",
+        action="store_true",
+        help="Include descendant subfolders under matched folders.",
+    )
     parser.add_argument("--output", default=OUTPUT_FILE, help="Markdown output path. Default: ~/emails_last_week.md")
     parser.add_argument("--max-body", type=int, default=MAX_BODY_LENGTH, help="Maximum body length. Default: 1000.")
     parser.add_argument(
@@ -768,6 +919,8 @@ def parse_args() -> Config:
     return Config(
         days_back=args.days,
         mail_folder=args.folder,
+        mail_folder_globs=tuple(args.folder_glob),
+        recursive_folders=args.recursive_folders,
         output_file=args.output,
         max_body_length=args.max_body,
         thunderbird_profile=args.profile,
@@ -788,7 +941,8 @@ def validate_config(config: Config) -> Config:
     if config.max_body_length < 1:
         raise ValueError("--max-body must be at least 1.")
     mail_folder = config.mail_folder.strip()
-    if not mail_folder:
+    mail_folder_globs = tuple(pattern.strip() for pattern in config.mail_folder_globs if pattern.strip())
+    if not mail_folder and not mail_folder_globs:
         raise ValueError("--folder must not be empty.")
     output_file = config.output_file.strip()
     if not output_file:
@@ -799,6 +953,7 @@ def validate_config(config: Config) -> Config:
     return replace(
         config,
         mail_folder=mail_folder,
+        mail_folder_globs=mail_folder_globs,
         output_file=output_file,
         thunderbird_profile=config.thunderbird_profile.strip(),
         thunderbird_account=config.thunderbird_account.strip(),
@@ -846,20 +1001,25 @@ def run_extraction(config: Config) -> ExtractionResult:
 
     profile_path = find_thunderbird_profile()
     account = resolve_mail_account(profile_path, validated.thunderbird_account)
-    mbox_path = find_mbox_path(profile_path, validated.mail_folder)
+    mbox_paths = find_mbox_paths(
+        profile_path,
+        validated.mail_folder,
+        folder_globs=validated.mail_folder_globs,
+        recursive=validated.recursive_folders,
+    )
 
     try:
-        if mbox_path.stat().st_size == 0:
+        if len(mbox_paths) == 1 and mbox_paths[0].stat().st_size == 0:
             raise RuntimeError(
-                f"The mail file {mbox_path} is empty. Sync Thunderbird and try again."
+                f"The mail file {mbox_paths[0]} is empty. Sync Thunderbird and try again."
             )
     except PermissionError as exc:
         raise PermissionError(
-            f"Permission denied when reading {mbox_path}. Check file permissions."
+            f"Permission denied when reading {mbox_paths[0]}. Check file permissions."
         ) from exc
 
-    emails = extract_emails(
-        mbox_path,
+    emails = extract_emails_from_mboxes(
+        mbox_paths,
         validated.days_back,
         validated.max_body_length,
         sender_filter=validated.sender_filter,
@@ -868,14 +1028,15 @@ def run_extraction(config: Config) -> ExtractionResult:
     )
     if LAST_EXTRACTION_STATS.total_in_mbox == 0:
         raise RuntimeError(
-            f"The mail file {mbox_path} does not contain any synced messages yet. "
+            f"The selected mail folders under {account.account_path} do not contain any synced messages yet. "
             "Open Thunderbird, click the folder, and let it sync."
         )
 
     return ExtractionResult(
         profile_path=profile_path,
         account_path=account.account_path,
-        mbox_path=mbox_path,
+        mbox_path=mbox_paths[0],
+        mbox_paths=mbox_paths,
         emails=emails,
         stats=ExtractionStats(
             total_in_mbox=LAST_EXTRACTION_STATS.total_in_mbox,

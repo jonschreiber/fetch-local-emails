@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import mailbox
 import shutil
 import sys
 from datetime import datetime
@@ -41,6 +42,26 @@ def add_second_account(profile_path: Path) -> Path:
     second_account_path = profile_path / "ImapMail" / "mail.backup.invalid"
     shutil.copytree(profile_path / "ImapMail" / "mail.example.invalid", second_account_path)
     return second_account_path
+
+
+def add_mailbox_message(
+    mailbox_path: Path,
+    *,
+    subject: str,
+    date: str = "Tue, 24 Mar 2026 10:00:00 -0400",
+    sender: str = "Folder Test <folder@example.com>",
+    body: str = "Folder body",
+) -> None:
+    mailbox_path.parent.mkdir(parents=True, exist_ok=True)
+    mbox = mailbox.mbox(str(mailbox_path))
+    message = EmailMessage()
+    message["From"] = sender
+    message["Date"] = date
+    message["Subject"] = subject
+    message.set_content(body)
+    mbox.add(message)
+    mbox.flush()
+    mbox.close()
 
 
 def test_extract_emails_filters_date_and_decodes_content(
@@ -85,6 +106,7 @@ def test_run_extraction_returns_profile_mbox_and_stats(
     assert result.profile_path == fixture_profile
     assert result.account_path == fixture_profile / "ImapMail" / "mail.example.invalid"
     assert result.mbox_path == fixture_profile / "ImapMail" / "mail.example.invalid" / "INBOX"
+    assert result.mbox_paths == [fixture_profile / "ImapMail" / "mail.example.invalid" / "INBOX"]
     assert result.stats.total_in_mbox == 4
     assert result.stats.matched_in_range == 2
     assert result.stats.matched_after_filters == 2
@@ -341,6 +363,81 @@ def test_find_mbox_path_uses_selected_account(
     monkeypatch.setattr(app, "RUNTIME_ACCOUNT_OVERRIDE", "mail.backup.invalid")
 
     assert app.find_mbox_path(fixture_profile, "INBOX") == second_account_path / "INBOX"
+
+
+def test_find_mbox_path_resolves_nested_thunderbird_folder(
+    fixture_profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_path = fixture_profile / "ImapMail" / "mail.example.invalid"
+    nested_mailbox = account_path / "2026.sbd" / "ProjectA"
+    nested_mailbox.parent.mkdir(parents=True, exist_ok=True)
+    nested_mailbox.touch()
+    monkeypatch.setattr(app, "RUNTIME_ACCOUNT_OVERRIDE", "")
+
+    assert app.find_mbox_path(fixture_profile, "2026/ProjectA") == nested_mailbox
+
+
+def test_find_mbox_paths_matches_shell_globs_and_descendants(
+    fixture_profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_path = fixture_profile / "ImapMail" / "mail.example.invalid"
+    top_level = account_path / "1Inbox"
+    nested = account_path / "1Inbox.sbd" / "ProjectA"
+    second_nested = account_path / "1Inbox.sbd" / "ProjectA.sbd" / "DeepTopic"
+    exact_match = account_path / "A1"
+    punctuation_match = account_path / "1a.z"
+    ignored = account_path / "Archive"
+    for path in (top_level, nested, second_nested, exact_match, punctuation_match, ignored):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+
+    monkeypatch.setattr(app, "RUNTIME_ACCOUNT_OVERRIDE", "")
+
+    assert app.find_mbox_paths(
+        fixture_profile,
+        "INBOX",
+        folder_globs=("1*", "A1", "1?.*"),
+        recursive=True,
+    ) == [top_level, nested, second_nested, punctuation_match, exact_match]
+
+
+def test_run_extraction_supports_recursive_folder_globs(
+    fixture_profile: Path,
+    frozen_now: None,
+) -> None:
+    account_path = fixture_profile / "ImapMail" / "mail.example.invalid"
+    top_level = account_path / "1Inbox"
+    nested = account_path / "1Inbox.sbd" / "ProjectA"
+    exact_match = account_path / "A1"
+    punctuation_match = account_path / "1a.z"
+    ignored = account_path / "Archive"
+    add_mailbox_message(top_level, subject="Top-level active folder")
+    add_mailbox_message(nested, subject="Nested active folder")
+    add_mailbox_message(exact_match, subject="Exact glob folder")
+    add_mailbox_message(punctuation_match, subject="Punctuation glob folder")
+    add_mailbox_message(ignored, subject="Archived folder")
+
+    result = app.run_extraction(
+        app.Config(
+            days_back=7,
+            mail_folder="INBOX",
+            mail_folder_globs=("1*", "A1", "1?.*"),
+            recursive_folders=True,
+            output_file="~/emails_last_week.md",
+            max_body_length=1000,
+            thunderbird_profile=str(fixture_profile),
+        )
+    )
+
+    subjects = [email["subject"] for email in result.emails]
+    assert "Top-level active folder" in subjects
+    assert "Nested active folder" in subjects
+    assert "Exact glob folder" in subjects
+    assert "Punctuation glob folder" in subjects
+    assert "Archived folder" not in subjects
+    assert result.mbox_paths == [top_level, nested, punctuation_match, exact_match]
 
 
 def test_render_account_discovery_includes_accounts(fixture_profile: Path) -> None:

@@ -17,7 +17,7 @@ It is intentionally simple, and doesn't depend on cloud/app access to your organ
 
 ## What It Does
 
-The script reads a Thunderbird mbox file from your local profile, filters
+The script reads one or more Thunderbird mbox files from your local profile, filters
 messages by date, optional sender filter, and optional subject filter, and extracts:
 
 - sender name
@@ -111,6 +111,29 @@ Extract a different folder:
 uv run python3 extract_emails.py --folder Sent --output ~/sent.md
 ```
 
+Extract top-level folders with shell-style name patterns, including subfolders:
+
+```bash
+uv run python3 extract_emails.py --folder-glob '1*' --folder-glob 'A1' --folder-glob '1?.*' --recursive-folders
+```
+
+`--folder-glob` uses shell-style matching against top-level Thunderbird folder
+names. For example:
+
+- `1*` matches folders starting with `1`
+- `A1` matches the exact folder name `A1`
+- `1?.*` matches names like `1a.z`
+
+The glob controls which folders are scanned. A glob can match folders and still
+produce zero extracted emails if those folders have no messages in the selected
+date range after filtering.
+
+Extract multiple top-level folder families with shell-style patterns:
+
+```bash
+uv run python3 extract_emails.py --folder-glob '1*' --folder-glob 'Project-*' --recursive-folders
+```
+
 Filter by sender with a partial email match:
 
 ```bash
@@ -171,6 +194,8 @@ Tool inputs:
 
 - `days`
 - `folder`
+- `folder_globs`
+- `recursive_folders`
 - `max_body`
 - `profile`
 - `account`
@@ -191,7 +216,8 @@ In `markdown` mode, the tool returns a JSON object containing metadata plus a
 `markdown` field with the rendered email output.
 
 In `json` mode, the tool returns a JSON object containing metadata plus an
-`emails` array.
+`emails` array. The payload also includes `mbox_paths` so callers can see which
+Thunderbird mailbox files were scanned.
 
 ### Codex Config
 
@@ -217,6 +243,10 @@ tool_timeout_sec = 300
   Number of days back to include. Default: `7`
 - `--folder`
   Thunderbird mbox filename to read. Default: `INBOX`
+- `--folder-glob`
+  Shell-style pattern for matching top-level Thunderbird folders. May be repeated, for example `1*`, `A1`, or `1?.*`.
+- `--recursive-folders`
+  Include descendant subfolders under the selected exact folder or matched glob folders
 - `--output`
   Markdown output file path. Default: `~/emails_last_week.md`
 - `--max-body`

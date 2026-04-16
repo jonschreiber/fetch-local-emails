@@ -64,6 +64,18 @@ def build_tools() -> list[types.Tool]:
                         "type": "string",
                         "description": 'Mailbox filename inside Thunderbird. Default "INBOX".',
                     },
+                    "folder_globs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional shell-style patterns that match top-level Thunderbird folders, "
+                            'for example [\"1*\"], [\"A1\"], or [\"1?.*\", \"Project-*\"]'
+                        ),
+                    },
+                    "recursive_folders": {
+                        "type": "boolean",
+                        "description": "When true, include descendant subfolders under matched folders.",
+                    },
                     "output_file": {
                         "type": "string",
                         "description": "Optional Markdown output file path used when write_to_file is true.",
@@ -150,6 +162,12 @@ def build_config(arguments: dict[str, Any] | None) -> tuple[Config, str, bool]:
     config = Config(
         days_back=_validate_optional_int(raw_arguments, "days", 7),
         mail_folder=_validate_optional_str(raw_arguments, "folder", "INBOX"),
+        mail_folder_globs=tuple(
+            value.strip()
+            for value in raw_arguments.get("folder_globs", [])
+            if isinstance(value, str) and value.strip()
+        ),
+        recursive_folders=_validate_optional_bool(raw_arguments, "recursive_folders", False),
         output_file=_validate_optional_str(raw_arguments, "output_file", "~/emails_last_week.md"),
         max_body_length=_validate_optional_int(raw_arguments, "max_body", 1000),
         thunderbird_profile=_validate_optional_str(raw_arguments, "profile", ""),
@@ -178,6 +196,7 @@ def build_markdown_payload(config: Config, write_to_file: bool) -> dict[str, obj
         "profile_path": str(result.profile_path),
         "account_path": str(result.account_path),
         "mbox_path": str(result.mbox_path),
+        "mbox_paths": [str(path) for path in result.mbox_paths],
         "stats": {
             "total_in_mbox": result.stats.total_in_mbox,
             "matched_in_range": result.stats.matched_in_range,
@@ -198,6 +217,7 @@ def build_json_payload(config: Config) -> dict[str, object]:
         "profile_path": str(result.profile_path),
         "account_path": str(result.account_path),
         "mbox_path": str(result.mbox_path),
+        "mbox_paths": [str(path) for path in result.mbox_paths],
         "stats": {
             "total_in_mbox": result.stats.total_in_mbox,
             "matched_in_range": result.stats.matched_in_range,
