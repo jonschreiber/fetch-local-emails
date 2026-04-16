@@ -250,6 +250,48 @@ def test_get_body_variants_returns_markdown_and_plain_text_for_html() -> None:
     )
 
 
+def test_get_body_variants_ignores_html_head_and_prefers_email_content_container() -> None:
+    message = EmailMessage()
+    message.set_type("multipart/alternative")
+    message.add_alternative(
+        """
+        <html>
+          <head>
+            <title>Message Title</title>
+            <style>
+              @media only screen and (max-device-width: 480px) {
+                .mobile-only { display: none !important; }
+              }
+            </style>
+          </head>
+          <body>
+            <div>Header chrome</div>
+            <div id="email-content-container">
+              <h2>AI Success Story</h2>
+              <p>OpenCode runbooks fully automated London Dev region deployment.</p>
+              <p><a href="https://example.com/runbook">Runbook</a></p>
+            </div>
+            <div>Footer chrome</div>
+          </body>
+        </html>
+        """,
+        subtype="html",
+    )
+
+    body_markdown, body_text = app.get_body_variants(message, 1000)
+
+    assert body_markdown == (
+        "## AI Success Story\n\n"
+        "OpenCode runbooks fully automated London Dev region deployment.\n\n"
+        "[Runbook](https://example.com/runbook)"
+    )
+    assert body_text == (
+        "AI Success Story\n\n"
+        "OpenCode runbooks fully automated London Dev region deployment.\n\n"
+        "Runbook (https://example.com/runbook)"
+    )
+
+
 def test_find_thunderbird_profile_auto_detects_first_profile(
     tmp_path: Path,
     fixture_source_profile: Path,

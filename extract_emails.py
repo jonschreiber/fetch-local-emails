@@ -52,7 +52,7 @@ from html import unescape
 from pathlib import Path
 from typing import Final
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 from markdownify import MarkdownConverter
 from rapidfuzz import fuzz
 
@@ -68,6 +68,25 @@ BODY_MODE = "rendered"
 
 SUBJECT_FUZZY_THRESHOLD: Final[int] = 80
 HTML_STRIP_TAGS: Final[list[str]] = ["script", "style"]
+HTML_DROP_TAGS: Final[list[str]] = ["head", "meta", "link", "base", "title", "noscript"]
+HTML_PREFERRED_SELECTORS: Final[tuple[str, ...]] = (
+    ".content-excerpt-pattern-container",
+    ".content-excerpt-pattern",
+    "#email-content-container",
+    "[role='main']",
+    "main",
+    "article",
+    "#content",
+    ".content",
+    ".wiki-content",
+    "body",
+)
+HTML_DROP_CLASSES: Final[tuple[str, ...]] = (
+    "toc-macro",
+    "actions-pattern",
+    "footer-pattern",
+    "sealed-section",
+)
 VALID_BODY_MODES: Final[set[str]] = {"rendered", "both"}
 MAIL_STORAGE_DIRECTORIES: Final[tuple[str, ...]] = ("ImapMail", "Mail")
 EXPECTED_PROFILE_HINT: Final[str] = "~/Library/Thunderbird/Profiles/*/{ImapMail,Mail}/<account>/"
@@ -318,6 +337,8 @@ class EmailMarkdownConverter(MarkdownConverter):
     """Markdownify converter with email-oriented handling for links and tables."""
 
     def convert_a(self, el, text, parent_tags):  # type: ignore[override]
+        if el is None:
+            return text
         href = (el.get("href") or "").strip()
         if text.strip():
             return super().convert_a(el, text, parent_tags)
@@ -337,6 +358,7 @@ class EmailMarkdownConverter(MarkdownConverter):
 def html_to_markdown_body(html_string: str) -> str:
     """Convert HTML into readable Markdown while preserving common structure."""
 
+    html_string = extract_html_content(html_string)
     markdown = EmailMarkdownConverter(
         heading_style="ATX",
         bullets="-",
@@ -355,11 +377,7 @@ def html_to_markdown_body(html_string: str) -> str:
 def html_to_plain_text(html_string: str) -> str:
     """Flatten HTML into readable plain text for search-friendly output."""
 
-    soup = BeautifulSoup(html_string, "html.parser")
-
-    for tag_name in HTML_STRIP_TAGS:
-        for tag in soup.find_all(tag_name):
-            tag.decompose()
+    soup = BeautifulSoup(extract_html_content(html_string), "html.parser")
 
     for br in soup.find_all("br"):
         br.replace_with("\n")
@@ -422,6 +440,45 @@ def html_to_plain_text(html_string: str) -> str:
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def extract_html_content(html_string: str) -> str:
+    """Return the most meaningful HTML fragment from a full email document."""
+
+    soup = BeautifulSoup(html_string, "html.parser")
+
+    for text_node in soup.find_all(string=lambda text: isinstance(text, Comment)):
+        text_node.extract()
+
+    for tag_name in [*HTML_STRIP_TAGS, *HTML_DROP_TAGS]:
+        for tag in soup.find_all(tag_name):
+            tag.decompose()
+
+    for tag in soup.select("[hidden], [aria-hidden='true']"):
+        tag.decompose()
+
+    for class_name in HTML_DROP_CLASSES:
+        for tag in soup.select(f".{class_name}"):
+            tag.decompose()
+
+    for tag in soup.find_all(style=True):
+        attrs = getattr(tag, "attrs", None)
+        if not attrs:
+            continue
+        style = attrs.get("style", "")
+        normalized_style = re.sub(r"\s+", "", style.casefold())
+        if "display:none" in normalized_style or "visibility:hidden" in normalized_style:
+            tag.decompose()
+
+    for selector in HTML_PREFERRED_SELECTORS:
+        candidate = soup.select_one(selector)
+        if candidate and candidate.get_text(" ", strip=True):
+            return str(candidate)
+
+    body = soup.body
+    if body and body.get_text(" ", strip=True):
+        return str(body)
+    return str(soup)
 
 
 def strip_html(html_string: str) -> str:
