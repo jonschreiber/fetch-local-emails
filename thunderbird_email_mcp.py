@@ -13,9 +13,13 @@ import mcp.types as types
 from mcp.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 
+import extract_emails as extractor
 from extract_emails import (
     Config,
+    discover_mail_accounts,
+    find_thunderbird_profile,
     render_markdown,
+    render_account_discovery,
     run_extraction,
     write_markdown,
 )
@@ -47,11 +51,33 @@ def build_tools() -> list[types.Tool]:
 
     return [
         types.Tool(
+            name="list_thunderbird_mail_accounts",
+            description=(
+                "List Thunderbird mail accounts discoverable from a local macOS profile so callers "
+                "can choose the correct account directory for extraction."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "profile": {
+                        "type": "string",
+                        "description": "Optional Thunderbird profile path override.",
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["text", "json"],
+                        "description": "Return account discovery as text or structured JSON. Default json.",
+                    },
+                },
+            },
+        ),
+        types.Tool(
             name="fetch_thunderbird_local_emails",
             description=(
                 "Read recent emails directly from Thunderbird's local macOS mbox storage and return "
-                "them as Markdown or structured JSON, with optional sender and subject filtering "
-                "and no cloud access."
+                "them as Markdown or structured JSON, with optional sender and subject filtering, "
+                "exact nested folder paths, shell-style top-level folder globs, and optional "
+                "recursive subfolder scanning."
             ),
             inputSchema={
                 "type": "object",
@@ -147,6 +173,23 @@ def _validate_optional_bool(arguments: dict[str, Any], name: str, default: bool)
     return value
 
 
+def _validate_optional_str_list(arguments: dict[str, Any], name: str) -> tuple[str, ...]:
+    value = arguments.get(name, [])
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError(f"{name} must be an array of strings.")
+
+    validated: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(f"{name} must be an array of strings.")
+        normalized = item.strip()
+        if normalized:
+            validated.append(normalized)
+    return tuple(validated)
+
+
 def build_config(arguments: dict[str, Any] | None) -> tuple[Config, str, bool]:
     """Build extractor config plus MCP-only options."""
 
@@ -162,11 +205,7 @@ def build_config(arguments: dict[str, Any] | None) -> tuple[Config, str, bool]:
     config = Config(
         days_back=_validate_optional_int(raw_arguments, "days", 7),
         mail_folder=_validate_optional_str(raw_arguments, "folder", "INBOX"),
-        mail_folder_globs=tuple(
-            value.strip()
-            for value in raw_arguments.get("folder_globs", [])
-            if isinstance(value, str) and value.strip()
-        ),
+        mail_folder_globs=_validate_optional_str_list(raw_arguments, "folder_globs"),
         recursive_folders=_validate_optional_bool(raw_arguments, "recursive_folders", False),
         output_file=_validate_optional_str(raw_arguments, "output_file", "~/emails_last_week.md"),
         max_body_length=_validate_optional_int(raw_arguments, "max_body", 1000),
@@ -178,6 +217,40 @@ def build_config(arguments: dict[str, Any] | None) -> tuple[Config, str, bool]:
         as_json=output_format == "json",
     )
     return config, output_format, write_to_file
+
+
+def build_account_discovery_payload(arguments: dict[str, Any] | None) -> dict[str, object]:
+    """Build a payload describing discoverable Thunderbird mail accounts."""
+
+    raw_arguments = arguments or {}
+    profile_override = _validate_optional_str(raw_arguments, "profile", "")
+    output_format = _validate_optional_str(raw_arguments, "format", "json").strip().lower()
+    if output_format not in {"json", "text"}:
+        raise ValueError("format must be either 'json' or 'text'.")
+
+    previous_override = extractor.RUNTIME_PROFILE_OVERRIDE
+    try:
+        extractor.RUNTIME_PROFILE_OVERRIDE = profile_override
+        profile_path = find_thunderbird_profile()
+    finally:
+        extractor.RUNTIME_PROFILE_OVERRIDE = previous_override
+
+    accounts = discover_mail_accounts(profile_path)
+    payload: dict[str, object] = {
+        "format": output_format,
+        "profile_path": str(profile_path),
+        "accounts": [
+            {
+                "account_name": account.account_name,
+                "storage_root": account.storage_root,
+                "account_path": str(account.account_path),
+            }
+            for account in accounts
+        ],
+    }
+    if output_format == "text":
+        payload["text"] = render_account_discovery(profile_path, accounts)
+    return payload
 
 
 def build_markdown_payload(config: Config, write_to_file: bool) -> dict[str, object]:
@@ -237,15 +310,18 @@ def config_output_path(config: Config) -> Path:
 async def call_tool_impl(name: str, arguments: dict[str, Any] | None) -> list[types.TextContent]:
     """Handle MCP tool calls."""
 
-    if name != "fetch_thunderbird_local_emails":
+    if name not in {"fetch_thunderbird_local_emails", "list_thunderbird_mail_accounts"}:
         return text_result(json.dumps({"error": f"Unknown tool: {name}"}, indent=2))
 
     try:
-        config, output_format, write_to_file = build_config(arguments)
-        if output_format == "markdown":
-            payload = await asyncio.to_thread(build_markdown_payload, config, write_to_file)
+        if name == "list_thunderbird_mail_accounts":
+            payload = await asyncio.to_thread(build_account_discovery_payload, arguments)
         else:
-            payload = await asyncio.to_thread(build_json_payload, config)
+            config, output_format, write_to_file = build_config(arguments)
+            if output_format == "markdown":
+                payload = await asyncio.to_thread(build_markdown_payload, config, write_to_file)
+            else:
+                payload = await asyncio.to_thread(build_json_payload, config)
         return text_result(json.dumps(payload, ensure_ascii=False, indent=2))
     except Exception as exc:  # noqa: BLE001
         logger.exception("Thunderbird extraction failed")

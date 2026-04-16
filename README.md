@@ -186,14 +186,24 @@ Run it locally with:
 uv run python3 thunderbird_email_mcp.py
 ```
 
-It exposes one MCP tool:
+It exposes two MCP tools:
 
+- `list_thunderbird_mail_accounts`
 - `fetch_thunderbird_local_emails`
+
+`list_thunderbird_mail_accounts` returns discoverable Thunderbird accounts for a
+profile so MCP clients can select the correct `account` value before fetching
+emails. It accepts:
+
+- `profile`
+- `format`
+  `json` or `text`
 
 Tool inputs:
 
 - `days`
 - `folder`
+  Exact Thunderbird folder path, including nested paths such as `2026/ProjectA`
 - `folder_globs`
 - `recursive_folders`
 - `max_body`
