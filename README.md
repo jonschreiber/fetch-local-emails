@@ -17,7 +17,7 @@ It is intentionally simple, and doesn't depend on cloud/app access to your organ
 
 ## What It Does
 
-The script reads a Thunderbird mbox file from your local profile, filters
+The script reads one or more Thunderbird mbox files from your local profile, filters
 messages by date, optional sender filter, and optional subject filter, and extracts:
 
 - sender name
@@ -111,6 +111,31 @@ Extract a different folder:
 uv run python3 extract_emails.py --folder Sent --output ~/sent.md
 ```
 
+Extract top-level folders with shell-style name patterns, including subfolders:
+
+```bash
+uv run python3 extract_emails.py --folder-glob '1*' --folder-glob 'A1' --folder-glob '1?.*' --recursive-folders
+```
+
+`--folder-glob` uses shell-style matching against top-level Thunderbird folder
+names. For example:
+
+- `1*` matches folders starting with `1`
+- `A1` matches the exact folder name `A1`
+- `1?.*` matches names like `1a.z`
+
+When `--folder-glob` is used, it replaces the default `INBOX` selection and
+scans only folders matched by the glob. Glob matching is case-insensitive, so
+`Inbox` matches Thunderbird's local `INBOX` file. Globs can also match
+Thunderbird parent folders that exist only as `.sbd` containers; use
+`--recursive-folders` to scan their child mailbox files.
+
+Extract multiple top-level folder families with shell-style patterns:
+
+```bash
+uv run python3 extract_emails.py --folder-glob '1*' --folder-glob 'Project-*' --recursive-folders
+```
+
 Filter by sender with a partial email match:
 
 ```bash
@@ -163,14 +188,26 @@ Run it locally with:
 uv run python3 thunderbird_email_mcp.py
 ```
 
-It exposes one MCP tool:
+It exposes two MCP tools:
 
+- `list_thunderbird_mail_accounts`
 - `fetch_thunderbird_local_emails`
+
+`list_thunderbird_mail_accounts` returns discoverable Thunderbird accounts for a
+profile so MCP clients can select the correct `account` value before fetching
+emails. It accepts:
+
+- `profile`
+- `format`
+  `json` or `text`
 
 Tool inputs:
 
 - `days`
 - `folder`
+  Exact Thunderbird folder path, including nested paths such as `2026/ProjectA`
+- `folder_globs`
+- `recursive_folders`
 - `max_body`
 - `profile`
 - `account`
@@ -191,7 +228,8 @@ In `markdown` mode, the tool returns a JSON object containing metadata plus a
 `markdown` field with the rendered email output.
 
 In `json` mode, the tool returns a JSON object containing metadata plus an
-`emails` array.
+`emails` array. The payload also includes `mbox_paths` so callers can see which
+Thunderbird mailbox files were scanned.
 
 ### Codex Config
 
@@ -216,7 +254,12 @@ tool_timeout_sec = 300
 - `--days`
   Number of days back to include. Default: `7`
 - `--folder`
-  Thunderbird mbox filename to read. Default: `INBOX`
+  Thunderbird mbox filename to read. Default: `INBOX`. Ignored when
+  `--folder-glob` is provided.
+- `--folder-glob`
+  Shell-style pattern for matching top-level Thunderbird folders. May be repeated, for example `1*`, `A1`, or `1?.*`. Parent folders stored only as `.sbd` containers require `--recursive-folders`.
+- `--recursive-folders`
+  Include descendant subfolders under the selected exact folder or matched glob folders
 - `--output`
   Markdown output file path. Default: `~/emails_last_week.md`
 - `--max-body`

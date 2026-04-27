@@ -39,20 +39,23 @@ Note:
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
-import mailbox
 import re
 import sys
+import warnings
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from email.header import decode_header
 from email.message import Message
+from email.parser import BytesParser
+from email.policy import compat32
 from email.utils import parseaddr, parsedate_to_datetime
 from html import unescape
 from pathlib import Path
-from typing import Final
+from typing import Final, Iterator
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment, XMLParsedAsHTMLWarning
 from markdownify import MarkdownConverter
 from rapidfuzz import fuzz
 
@@ -68,10 +71,31 @@ BODY_MODE = "rendered"
 
 SUBJECT_FUZZY_THRESHOLD: Final[int] = 80
 HTML_STRIP_TAGS: Final[list[str]] = ["script", "style"]
+HTML_DROP_TAGS: Final[list[str]] = ["head", "meta", "link", "base", "title", "noscript"]
+HTML_PREFERRED_SELECTORS: Final[tuple[str, ...]] = (
+    ".content-excerpt-pattern-container",
+    ".content-excerpt-pattern",
+    "#email-content-container",
+    "[role='main']",
+    "main",
+    "article",
+    "#content",
+    ".content",
+    ".wiki-content",
+    "body",
+)
+HTML_DROP_CLASSES: Final[tuple[str, ...]] = (
+    "toc-macro",
+    "actions-pattern",
+    "footer-pattern",
+    "sealed-section",
+)
 VALID_BODY_MODES: Final[set[str]] = {"rendered", "both"}
 MAIL_STORAGE_DIRECTORIES: Final[tuple[str, ...]] = ("ImapMail", "Mail")
 EXPECTED_PROFILE_HINT: Final[str] = "~/Library/Thunderbird/Profiles/*/{ImapMail,Mail}/<account>/"
 DISCOVERY_COMMAND_HINT: Final[str] = "uv run python3 extract_emails.py --list-accounts"
+
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 
 @dataclass(frozen=True)
@@ -80,6 +104,8 @@ class Config:
 
     days_back: int = DAYS_BACK
     mail_folder: str = MAIL_FOLDER
+    mail_folder_globs: tuple[str, ...] = ()
+    recursive_folders: bool = False
     output_file: str = OUTPUT_FILE
     max_body_length: int = MAX_BODY_LENGTH
     thunderbird_profile: str = THUNDERBIRD_PROFILE
@@ -108,6 +134,7 @@ class ExtractionResult:
     profile_path: Path
     account_path: Path
     mbox_path: Path
+    mbox_paths: list[Path]
     emails: list[dict[str, str]]
     stats: ExtractionStats
 
@@ -263,17 +290,165 @@ def find_thunderbird_profile() -> Path:
     return candidates[0]
 
 
-def find_mbox_path(profile: Path, folder: str) -> Path:
-    """Resolve the Thunderbird mbox path for the selected folder."""
+def is_mailbox_file(path: Path) -> bool:
+    """Return true when the path looks like a Thunderbird mbox folder file."""
+
+    if not path.is_file():
+        return False
+    if path.name.startswith("."):
+        return False
+    if path.name.endswith(".msf") or path.name.endswith(".dat") or path.name.endswith(".sqlite"):
+        return False
+    return path.suffix not in {".sbd", ".mozmsgs"}
+
+
+def is_mailbox_container(path: Path) -> bool:
+    """Return true when the path is a Thunderbird subfolder container."""
+
+    return path.is_dir() and path.name.endswith(".sbd")
+
+
+def mailbox_name_for_container(path: Path) -> str:
+    """Return the visible Thunderbird folder name for a `.sbd` container."""
+
+    if path.name.endswith(".sbd"):
+        return path.name[:-4]
+    return path.name
+
+
+def folder_name_matches_globs(folder_name: str, folder_globs: tuple[str, ...]) -> bool:
+    """Return true when a folder name matches shell globs case-insensitively."""
+
+    normalized_name = folder_name.casefold()
+    return any(
+        fnmatch.fnmatchcase(normalized_name, pattern.casefold())
+        for pattern in folder_globs
+    )
+
+
+def resolve_nested_mail_folder(account_path: Path, folder: str) -> Path:
+    """Resolve a possibly nested Thunderbird folder path like `Foo/Bar/Baz`."""
+
+    parts = [part for part in Path(folder).parts if part not in {"", "."}]
+    if not parts:
+        raise ValueError("--folder must not be empty.")
+
+    current_parent = account_path
+    current_path = current_parent / parts[0]
+    for part in parts[1:]:
+        current_parent = current_path.with_name(f"{current_path.name}.sbd")
+        current_path = current_parent / part
+    return current_path
+
+
+def iter_descendant_mailboxes(folder_path: Path) -> list[Path]:
+    """Return mailbox files under the folder's `.sbd` directory, recursively."""
+
+    descendants: list[Path] = []
+    if is_mailbox_container(folder_path):
+        root = folder_path
+    else:
+        root = folder_path.with_name(f"{folder_path.name}.sbd")
+    if not root.is_dir():
+        return descendants
+
+    def walk(directory: Path) -> None:
+        if not directory.is_dir():
+            return
+        for child in sorted(directory.iterdir()):
+            if is_mailbox_file(child):
+                descendants.append(child)
+                walk(child.with_name(f"{child.name}.sbd"))
+
+    walk(root)
+    return descendants
+
+
+def dedupe_paths(paths: list[Path]) -> list[Path]:
+    """Return paths in first-seen order without duplicates."""
+
+    seen: set[Path] = set()
+    deduped: list[Path] = []
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        deduped.append(path)
+    return deduped
+
+
+def find_mbox_paths(
+    profile: Path,
+    folder: str,
+    folder_globs: tuple[str, ...] = (),
+    recursive: bool = False,
+) -> list[Path]:
+    """Resolve one or more Thunderbird mbox files for extraction."""
 
     account = resolve_mail_account(profile.expanduser(), RUNTIME_ACCOUNT_OVERRIDE)
-    mbox_path = account.account_path / folder
+
+    matched_container_names: list[str] = []
+    if folder_globs:
+        matched_paths: list[Path] = []
+        for child in sorted(account.account_path.iterdir()):
+            if is_mailbox_file(child):
+                folder_name = child.name
+            elif is_mailbox_container(child):
+                folder_name = mailbox_name_for_container(child)
+            else:
+                continue
+
+            if not folder_name_matches_globs(folder_name, folder_globs):
+                continue
+
+            if is_mailbox_file(child):
+                matched_paths.append(child)
+                if recursive:
+                    matched_paths.extend(iter_descendant_mailboxes(child))
+            elif recursive:
+                matched_paths.extend(iter_descendant_mailboxes(child))
+            else:
+                matched_container_names.append(folder_name)
+
+        if not matched_paths:
+            patterns = ", ".join(folder_globs)
+            if matched_container_names:
+                containers = ", ".join(matched_container_names)
+                raise FileNotFoundError(
+                    f"Thunderbird mail folder glob(s) matched container folders only: {containers}. "
+                    "Use --recursive-folders to include their synced subfolders."
+                )
+            raise FileNotFoundError(
+                f"No Thunderbird mail folders under {account.account_path} matched: {patterns}. "
+                "Open Thunderbird, click the target folders so they sync locally, then try again."
+            )
+
+        if matched_container_names:
+            containers = ", ".join(matched_container_names)
+            eprint(
+                "Warning: folder glob(s) matched container folders without scanning their subfolders: "
+                f"{containers}. Use --recursive-folders to include them."
+            )
+
+        return dedupe_paths(matched_paths)
+
+    mbox_path = resolve_nested_mail_folder(account.account_path, folder)
     if not mbox_path.exists():
         raise FileNotFoundError(
             f"The Thunderbird mail file {mbox_path} was not found. "
             "Open Thunderbird, click the target folder so it syncs locally, then try again."
         )
-    return mbox_path
+
+    resolved_paths = [mbox_path]
+    if recursive:
+        resolved_paths.extend(iter_descendant_mailboxes(mbox_path))
+    return dedupe_paths(resolved_paths)
+
+
+def find_mbox_path(profile: Path, folder: str) -> Path:
+    """Resolve a single Thunderbird mbox path for backward-compatible callers."""
+
+    return find_mbox_paths(profile, folder)[0]
 
 
 def decode_header_value(raw: str | None) -> str:
@@ -314,10 +489,84 @@ def decode_bytes(payload: bytes, preferred_charset: str | None) -> str:
     return payload.decode("utf-8", errors="replace")
 
 
+def normalize_parsed_datetime(parsed: datetime) -> datetime:
+    """Return a local naive datetime for comparison and output."""
+
+    if parsed.tzinfo is not None:
+        return parsed.astimezone().replace(tzinfo=None)
+    return parsed
+
+
+def parse_datetime_candidate(candidate: str) -> datetime | None:
+    """Parse one email-style timestamp candidate."""
+
+    try:
+        parsed = parsedate_to_datetime(candidate)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if parsed is None:
+        return None
+    return normalize_parsed_datetime(parsed)
+
+
+def parse_mbox_from_datetime(from_line: str) -> datetime | None:
+    """Parse the timestamp from an mbox envelope `From ` line."""
+
+    if not from_line.startswith("From "):
+        return None
+
+    tokens = from_line.strip().split()
+    for start_index in range(2, min(len(tokens), 5)):
+        parsed = parse_datetime_candidate(" ".join(tokens[start_index:]))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def decode_mbox_line(line: bytes) -> str:
+    """Decode an mbox separator line for date parsing and diagnostics."""
+
+    return line.decode("utf-8", errors="replace").rstrip("\r\n")
+
+
+def iter_mbox_messages(mbox_path: Path) -> Iterator[tuple[int, Message, str]]:
+    """Yield messages from an mbox, ignoring bogus `From ` lines in message bodies."""
+
+    parser = BytesParser(policy=compat32)
+    envelope_from = ""
+    message_bytes = bytearray()
+    message_index = 0
+
+    with mbox_path.open("rb") as handle:
+        for line in handle:
+            decoded_line = decode_mbox_line(line) if line.startswith(b"From ") else ""
+            is_separator = bool(decoded_line and parse_mbox_from_datetime(decoded_line) is not None)
+
+            if is_separator:
+                if envelope_from:
+                    message_index += 1
+                    yield message_index, parser.parsebytes(bytes(message_bytes)), envelope_from
+                envelope_from = decoded_line
+                message_bytes = bytearray()
+                continue
+
+            if not envelope_from:
+                if not line.strip():
+                    continue
+                envelope_from = ""
+            message_bytes.extend(line)
+
+    if envelope_from or message_bytes:
+        message_index += 1
+        yield message_index, parser.parsebytes(bytes(message_bytes)), envelope_from
+
+
 class EmailMarkdownConverter(MarkdownConverter):
     """Markdownify converter with email-oriented handling for links and tables."""
 
     def convert_a(self, el, text, parent_tags):  # type: ignore[override]
+        if el is None:
+            return text
         href = (el.get("href") or "").strip()
         if text.strip():
             return super().convert_a(el, text, parent_tags)
@@ -337,6 +586,7 @@ class EmailMarkdownConverter(MarkdownConverter):
 def html_to_markdown_body(html_string: str) -> str:
     """Convert HTML into readable Markdown while preserving common structure."""
 
+    html_string = extract_html_content(html_string)
     markdown = EmailMarkdownConverter(
         heading_style="ATX",
         bullets="-",
@@ -355,11 +605,7 @@ def html_to_markdown_body(html_string: str) -> str:
 def html_to_plain_text(html_string: str) -> str:
     """Flatten HTML into readable plain text for search-friendly output."""
 
-    soup = BeautifulSoup(html_string, "html.parser")
-
-    for tag_name in HTML_STRIP_TAGS:
-        for tag in soup.find_all(tag_name):
-            tag.decompose()
+    soup = BeautifulSoup(extract_html_content(html_string), "html.parser")
 
     for br in soup.find_all("br"):
         br.replace_with("\n")
@@ -422,6 +668,45 @@ def html_to_plain_text(html_string: str) -> str:
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def extract_html_content(html_string: str) -> str:
+    """Return the most meaningful HTML fragment from a full email document."""
+
+    soup = BeautifulSoup(html_string, "html.parser")
+
+    for text_node in soup.find_all(string=lambda text: isinstance(text, Comment)):
+        text_node.extract()
+
+    for tag_name in [*HTML_STRIP_TAGS, *HTML_DROP_TAGS]:
+        for tag in soup.find_all(tag_name):
+            tag.decompose()
+
+    for tag in soup.select("[hidden], [aria-hidden='true']"):
+        tag.decompose()
+
+    for class_name in HTML_DROP_CLASSES:
+        for tag in soup.select(f".{class_name}"):
+            tag.decompose()
+
+    for tag in soup.find_all(style=True):
+        attrs = getattr(tag, "attrs", None)
+        if not attrs:
+            continue
+        style = attrs.get("style", "")
+        normalized_style = re.sub(r"\s+", "", style.casefold())
+        if "display:none" in normalized_style or "visibility:hidden" in normalized_style:
+            tag.decompose()
+
+    for selector in HTML_PREFERRED_SELECTORS:
+        candidate = soup.select_one(selector)
+        if candidate and candidate.get_text(" ", strip=True):
+            return str(candidate)
+
+    body = soup.body
+    if body and body.get_text(" ", strip=True):
+        return str(body)
+    return str(soup)
 
 
 def strip_html(html_string: str) -> str:
@@ -495,7 +780,7 @@ def get_body_variants(message: Message, max_length: int) -> tuple[str, str]:
     return normalize_body(body_markdown, max_length), normalize_body(body_text, max_length)
 
 
-def parse_message_datetime(message: Message) -> datetime | None:
+def parse_message_datetime(message: Message, envelope_from: str = "") -> datetime | None:
     """Return the best available message timestamp as a local naive datetime."""
 
     candidates: list[str] = []
@@ -509,15 +794,11 @@ def parse_message_datetime(message: Message) -> datetime | None:
             candidates.append(received_value.rsplit(";", 1)[-1].strip())
 
     for candidate in candidates:
-        try:
-            parsed = parsedate_to_datetime(candidate)
-        except (TypeError, ValueError, IndexError, OverflowError):
-            continue
-        if parsed is None:
-            continue
-        if parsed.tzinfo is not None:
-            return parsed.astimezone().replace(tzinfo=None)
-        return parsed
+        parsed = parse_datetime_candidate(candidate)
+        if parsed is not None:
+            return parsed
+    if envelope_from:
+        return parse_mbox_from_datetime(envelope_from)
     return None
 
 
@@ -594,17 +875,10 @@ def extract_emails(
     extracted: list[dict[str, str]] = []
 
     try:
-        mbox = mailbox.mbox(str(mbox_path), create=False)
-    except PermissionError as exc:
-        raise PermissionError(
-            f"Permission denied when opening {mbox_path}. Check file permissions."
-        ) from exc
-
-    try:
-        for index, message in enumerate(mbox, start=1):
+        for index, message, envelope_from in iter_mbox_messages(mbox_path):
             LAST_EXTRACTION_STATS.total_in_mbox += 1
             try:
-                message_datetime = parse_message_datetime(message)
+                message_datetime = parse_message_datetime(message, envelope_from)
                 if message_datetime is None:
                     raise ValueError("missing or invalid Date header")
                 if message_datetime < cutoff:
@@ -637,10 +911,51 @@ def extract_emails(
                 LAST_EXTRACTION_STATS.skipped_malformed += 1
                 eprint(f"Warning: skipped malformed email #{index}: {exc}")
                 continue
-    finally:
-        mbox.close()
+    except PermissionError as exc:
+        raise PermissionError(
+            f"Permission denied when opening {mbox_path}. Check file permissions."
+        ) from exc
 
     LAST_EXTRACTION_STATS.matched_after_filters = len(extracted)
+    return extracted
+
+
+def extract_emails_from_mboxes(
+    mbox_paths: list[Path],
+    days_back: int,
+    max_body: int,
+    sender_filter: str = "",
+    subject_filter: str = "",
+    body_mode: str = BODY_MODE,
+) -> list[dict[str, str]]:
+    """Extract emails from multiple Thunderbird mbox files."""
+
+    global LAST_EXTRACTION_STATS
+    aggregate_stats = ExtractionStats()
+
+    extracted: list[dict[str, str]] = []
+    for mbox_path in mbox_paths:
+        emails = extract_emails(
+            mbox_path,
+            days_back,
+            max_body,
+            sender_filter=sender_filter,
+            subject_filter=subject_filter,
+            body_mode=body_mode,
+        )
+        extracted.extend(emails)
+        aggregate_stats = ExtractionStats(
+            total_in_mbox=aggregate_stats.total_in_mbox + LAST_EXTRACTION_STATS.total_in_mbox,
+            matched_in_range=aggregate_stats.matched_in_range + LAST_EXTRACTION_STATS.matched_in_range,
+            matched_after_filters=aggregate_stats.matched_after_filters + LAST_EXTRACTION_STATS.matched_after_filters,
+            skipped_malformed=aggregate_stats.skipped_malformed + LAST_EXTRACTION_STATS.skipped_malformed,
+        )
+    LAST_EXTRACTION_STATS = ExtractionStats(
+        total_in_mbox=aggregate_stats.total_in_mbox,
+        matched_in_range=aggregate_stats.matched_in_range,
+        matched_after_filters=len(extracted),
+        skipped_malformed=aggregate_stats.skipped_malformed,
+    )
     return extracted
 
 
@@ -668,6 +983,20 @@ def parse_args() -> Config:
     )
     parser.add_argument("--days", type=int, default=DAYS_BACK, help="Days back to include. Default: 7.")
     parser.add_argument("--folder", default=MAIL_FOLDER, help='Mailbox filename. Default: "INBOX".')
+    parser.add_argument(
+        "--folder-glob",
+        action="append",
+        default=[],
+        help=(
+            "Optional shell-style pattern for matching top-level Thunderbird folders, "
+            'for example "1*", "A1", or "1?.*". Repeat to include multiple patterns.'
+        ),
+    )
+    parser.add_argument(
+        "--recursive-folders",
+        action="store_true",
+        help="Include descendant subfolders under matched folders.",
+    )
     parser.add_argument("--output", default=OUTPUT_FILE, help="Markdown output path. Default: ~/emails_last_week.md")
     parser.add_argument("--max-body", type=int, default=MAX_BODY_LENGTH, help="Maximum body length. Default: 1000.")
     parser.add_argument(
@@ -711,6 +1040,8 @@ def parse_args() -> Config:
     return Config(
         days_back=args.days,
         mail_folder=args.folder,
+        mail_folder_globs=tuple(args.folder_glob),
+        recursive_folders=args.recursive_folders,
         output_file=args.output,
         max_body_length=args.max_body,
         thunderbird_profile=args.profile,
@@ -731,7 +1062,8 @@ def validate_config(config: Config) -> Config:
     if config.max_body_length < 1:
         raise ValueError("--max-body must be at least 1.")
     mail_folder = config.mail_folder.strip()
-    if not mail_folder:
+    mail_folder_globs = tuple(pattern.strip() for pattern in config.mail_folder_globs if pattern.strip())
+    if not mail_folder and not mail_folder_globs:
         raise ValueError("--folder must not be empty.")
     output_file = config.output_file.strip()
     if not output_file:
@@ -742,6 +1074,7 @@ def validate_config(config: Config) -> Config:
     return replace(
         config,
         mail_folder=mail_folder,
+        mail_folder_globs=mail_folder_globs,
         output_file=output_file,
         thunderbird_profile=config.thunderbird_profile.strip(),
         thunderbird_account=config.thunderbird_account.strip(),
@@ -789,20 +1122,25 @@ def run_extraction(config: Config) -> ExtractionResult:
 
     profile_path = find_thunderbird_profile()
     account = resolve_mail_account(profile_path, validated.thunderbird_account)
-    mbox_path = find_mbox_path(profile_path, validated.mail_folder)
+    mbox_paths = find_mbox_paths(
+        profile_path,
+        validated.mail_folder,
+        folder_globs=validated.mail_folder_globs,
+        recursive=validated.recursive_folders,
+    )
 
     try:
-        if mbox_path.stat().st_size == 0:
+        if len(mbox_paths) == 1 and mbox_paths[0].stat().st_size == 0:
             raise RuntimeError(
-                f"The mail file {mbox_path} is empty. Sync Thunderbird and try again."
+                f"The mail file {mbox_paths[0]} is empty. Sync Thunderbird and try again."
             )
     except PermissionError as exc:
         raise PermissionError(
-            f"Permission denied when reading {mbox_path}. Check file permissions."
+            f"Permission denied when reading {mbox_paths[0]}. Check file permissions."
         ) from exc
 
-    emails = extract_emails(
-        mbox_path,
+    emails = extract_emails_from_mboxes(
+        mbox_paths,
         validated.days_back,
         validated.max_body_length,
         sender_filter=validated.sender_filter,
@@ -811,14 +1149,15 @@ def run_extraction(config: Config) -> ExtractionResult:
     )
     if LAST_EXTRACTION_STATS.total_in_mbox == 0:
         raise RuntimeError(
-            f"The mail file {mbox_path} does not contain any synced messages yet. "
+            f"The selected mail folders under {account.account_path} do not contain any synced messages yet. "
             "Open Thunderbird, click the folder, and let it sync."
         )
 
     return ExtractionResult(
         profile_path=profile_path,
         account_path=account.account_path,
-        mbox_path=mbox_path,
+        mbox_path=mbox_paths[0],
+        mbox_paths=mbox_paths,
         emails=emails,
         stats=ExtractionStats(
             total_in_mbox=LAST_EXTRACTION_STATS.total_in_mbox,
