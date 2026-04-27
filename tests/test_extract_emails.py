@@ -75,18 +75,60 @@ def test_extract_emails_filters_date_and_decodes_content(
 
     emails = app.extract_emails(mbox_path, days_back=7, max_body=1000)
 
-    assert len(emails) == 2
+    assert len(emails) == 3
     assert [email["subject"] for email in emails] == [
         "Weekly sync notes",
         "Möbius meeting assets",
+        "Missing date",
     ]
     assert emails[0]["from_name"] == "Alice Example"
     assert emails[1]["from_email"] == "no-reply@zoom.us"
     assert emails[1]["body"] == "Hello\\\nworld\n\nRésumé"
+    assert emails[2]["date"] == "2026-03-25 10:00"
     assert app.LAST_EXTRACTION_STATS.total_in_mbox == 4
-    assert app.LAST_EXTRACTION_STATS.matched_in_range == 2
-    assert app.LAST_EXTRACTION_STATS.matched_after_filters == 2
-    assert app.LAST_EXTRACTION_STATS.skipped_malformed == 1
+    assert app.LAST_EXTRACTION_STATS.matched_in_range == 3
+    assert app.LAST_EXTRACTION_STATS.matched_after_filters == 3
+    assert app.LAST_EXTRACTION_STATS.skipped_malformed == 0
+
+
+def test_extract_emails_keeps_unescaped_from_lines_inside_message_body(
+    tmp_path: Path,
+    frozen_now: None,
+) -> None:
+    mbox_path = tmp_path / "INBOX"
+    mbox_path.write_text(
+        """From first@example.com Tue Mar 24 09:30:00 2026
+From: First Example <first@example.com>
+Date: Tue, 24 Mar 2026 09:30:00 -0400
+Subject: Body starts with From
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Opening line.
+From what I can tell, this is still the same email body.
+Closing line.
+
+From second@example.com Tue Mar 24 10:30:00 2026
+From: Second Example <second@example.com>
+Date: Tue, 24 Mar 2026 10:30:00 -0400
+Subject: Next real message
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Second body.
+""",
+        encoding="utf-8",
+    )
+
+    emails = app.extract_emails(mbox_path, days_back=7, max_body=1000)
+
+    assert [email["subject"] for email in emails] == [
+        "Body starts with From",
+        "Next real message",
+    ]
+    assert "From what I can tell" in emails[0]["body"]
+    assert app.LAST_EXTRACTION_STATS.total_in_mbox == 2
+    assert app.LAST_EXTRACTION_STATS.skipped_malformed == 0
 
 
 def test_run_extraction_returns_profile_mbox_and_stats(
@@ -108,9 +150,9 @@ def test_run_extraction_returns_profile_mbox_and_stats(
     assert result.mbox_path == fixture_profile / "ImapMail" / "mail.example.invalid" / "INBOX"
     assert result.mbox_paths == [fixture_profile / "ImapMail" / "mail.example.invalid" / "INBOX"]
     assert result.stats.total_in_mbox == 4
-    assert result.stats.matched_in_range == 2
-    assert result.stats.matched_after_filters == 2
-    assert result.stats.skipped_malformed == 1
+    assert result.stats.matched_in_range == 3
+    assert result.stats.matched_after_filters == 3
+    assert result.stats.skipped_malformed == 0
 
 
 def test_extract_emails_filters_by_partial_sender(
@@ -127,7 +169,7 @@ def test_extract_emails_filters_by_partial_sender(
     assert len(emails) == 1
     assert emails[0]["from_email"] == "no-reply@zoom.us"
     assert emails[0]["subject"] == "Möbius meeting assets"
-    assert app.LAST_EXTRACTION_STATS.matched_in_range == 2
+    assert app.LAST_EXTRACTION_STATS.matched_in_range == 3
     assert app.LAST_EXTRACTION_STATS.matched_after_filters == 1
 
 
@@ -144,7 +186,7 @@ def test_extract_emails_filters_by_fuzzy_subject(
 
     assert len(emails) == 1
     assert emails[0]["subject"] == "Möbius meeting assets"
-    assert app.LAST_EXTRACTION_STATS.matched_in_range == 2
+    assert app.LAST_EXTRACTION_STATS.matched_in_range == 3
     assert app.LAST_EXTRACTION_STATS.matched_after_filters == 1
 
 
@@ -166,7 +208,7 @@ def test_run_extraction_combines_sender_and_subject_filters(
 
     assert len(result.emails) == 1
     assert result.emails[0]["subject"] == "Möbius meeting assets"
-    assert result.stats.matched_in_range == 2
+    assert result.stats.matched_in_range == 3
     assert result.stats.matched_after_filters == 1
 
 
@@ -185,12 +227,13 @@ def test_run_extraction_with_body_mode_both_includes_markdown_and_text(
         )
     )
 
-    assert len(result.emails) == 2
+    assert len(result.emails) == 3
     assert result.emails[0]["body_markdown"] == "Plain text body for the weekly sync.\nContinuation line."
     assert result.emails[0]["body_text"] == "Plain text body for the weekly sync.\nContinuation line."
     assert result.emails[1]["body"] == "Hello\\\nworld\n\nRésumé"
     assert result.emails[1]["body_markdown"] == "Hello\\\nworld\n\nRésumé"
     assert result.emails[1]["body_text"] == "Hello\nworld\n\nRésumé"
+    assert result.emails[2]["body_markdown"] == "This one should be skipped because it has no date."
 
 
 def test_get_plain_text_body_converts_html_to_markdown_with_structure() -> None:
@@ -314,6 +357,47 @@ def test_get_body_variants_ignores_html_head_and_prefers_email_content_container
     )
 
 
+def test_get_body_variants_drops_confluence_boilerplate_from_preferred_content() -> None:
+    message = EmailMessage()
+    message.set_type("multipart/alternative")
+    message.add_alternative(
+        """
+        <html>
+          <body>
+            <div class="toc-macro">Table of contents</div>
+            <div class="content-excerpt-pattern-container">
+              <h2>Launch Readiness</h2>
+              <p>The rollout notes are ready for review.</p>
+              <p hidden>Hidden draft content</p>
+              <p aria-hidden="true">Screen-reader hidden chrome</p>
+              <p style="display: none">Inline hidden content</p>
+              <p style="visibility: hidden">Invisible inline content</p>
+              <div class="actions-pattern">Like Reply Forward</div>
+            </div>
+            <div class="footer-pattern">Confluence footer chrome</div>
+          </body>
+        </html>
+        """,
+        subtype="html",
+    )
+
+    body_markdown, body_text = app.get_body_variants(message, 1000)
+
+    assert "Launch Readiness" in body_markdown
+    assert "The rollout notes are ready for review." in body_text
+    for dropped_text in (
+        "Table of contents",
+        "Hidden draft content",
+        "Screen-reader hidden chrome",
+        "Inline hidden content",
+        "Invisible inline content",
+        "Like Reply Forward",
+        "Confluence footer chrome",
+    ):
+        assert dropped_text not in body_markdown
+        assert dropped_text not in body_text
+
+
 def test_find_thunderbird_profile_auto_detects_first_profile(
     tmp_path: Path,
     fixture_source_profile: Path,
@@ -378,7 +462,7 @@ def test_find_mbox_path_resolves_nested_thunderbird_folder(
     assert app.find_mbox_path(fixture_profile, "2026/ProjectA") == nested_mailbox
 
 
-def test_find_mbox_paths_matches_shell_globs_and_descendants(
+def test_find_mbox_paths_matches_shell_globs_and_descendants_without_inbox(
     fixture_profile: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -401,6 +485,97 @@ def test_find_mbox_paths_matches_shell_globs_and_descendants(
         folder_globs=("1*", "A1", "1?.*"),
         recursive=True,
     ) == [top_level, nested, second_nested, punctuation_match, exact_match]
+
+
+def test_find_mbox_paths_ignores_thunderbird_sidecar_files_for_globs(
+    fixture_profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_path = fixture_profile / "ImapMail" / "mail.example.invalid"
+    mailbox_path = account_path / "1Inbox"
+    sidecar_paths = [
+        account_path / "1Inbox.msf",
+        account_path / "1Inbox.dat",
+        account_path / "1Inbox.sqlite",
+        account_path / ".1Hidden",
+        account_path / "1Inbox.mozmsgs",
+    ]
+    mailbox_path.touch()
+    for sidecar_path in sidecar_paths:
+        sidecar_path.touch()
+    (account_path / "1Inbox.sbd").mkdir()
+
+    monkeypatch.setattr(app, "RUNTIME_ACCOUNT_OVERRIDE", "")
+
+    assert app.find_mbox_paths(fixture_profile, "", folder_globs=("1*",)) == [mailbox_path]
+
+
+def test_find_mbox_paths_matches_folder_globs_case_insensitively(
+    fixture_profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(app, "RUNTIME_ACCOUNT_OVERRIDE", "")
+
+    assert app.find_mbox_paths(fixture_profile, "INBOX", folder_globs=("Inbox",)) == [
+        fixture_profile / "ImapMail" / "mail.example.invalid" / "INBOX"
+    ]
+
+
+def test_find_mbox_paths_matches_sbd_only_container_globs_with_recursive(
+    fixture_profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_path = fixture_profile / "ImapMail" / "mail.example.invalid"
+    child = account_path / "11. Meeting Minutes.sbd" / "Graalbase Meeting Minutes"
+    sibling = account_path / "11. Meeting Minutes.sbd" / "Micronaut"
+    for path in (child, sibling):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    (account_path / "11. Meeting Minutes.msf").touch()
+
+    monkeypatch.setattr(app, "RUNTIME_ACCOUNT_OVERRIDE", "")
+
+    assert app.find_mbox_paths(
+        fixture_profile,
+        "",
+        folder_globs=("11.*",),
+        recursive=True,
+    ) == [child, sibling]
+
+
+def test_find_mbox_paths_explains_sbd_only_container_globs_need_recursive(
+    fixture_profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_path = fixture_profile / "ImapMail" / "mail.example.invalid"
+    (account_path / "11. Meeting Minutes.sbd").mkdir()
+    (account_path / "11. Meeting Minutes.msf").touch()
+
+    monkeypatch.setattr(app, "RUNTIME_ACCOUNT_OVERRIDE", "")
+
+    with pytest.raises(FileNotFoundError, match="Use --recursive-folders"):
+        app.find_mbox_paths(fixture_profile, "", folder_globs=("11.*",))
+
+
+def test_find_mbox_paths_includes_descendants_for_exact_recursive_folder(
+    fixture_profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_path = fixture_profile / "ImapMail" / "mail.example.invalid"
+    parent = account_path / "Projects"
+    child = account_path / "Projects.sbd" / "Apollo"
+    grandchild = account_path / "Projects.sbd" / "Apollo.sbd" / "Launch"
+    for path in (parent, child, grandchild):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+
+    monkeypatch.setattr(app, "RUNTIME_ACCOUNT_OVERRIDE", "")
+
+    assert app.find_mbox_paths(fixture_profile, "Projects", recursive=True) == [
+        parent,
+        child,
+        grandchild,
+    ]
 
 
 def test_run_extraction_supports_recursive_folder_globs(
@@ -436,6 +611,7 @@ def test_run_extraction_supports_recursive_folder_globs(
     assert "Nested active folder" in subjects
     assert "Exact glob folder" in subjects
     assert "Punctuation glob folder" in subjects
+    assert "Weekly sync notes" not in subjects
     assert "Archived folder" not in subjects
     assert result.mbox_paths == [top_level, nested, punctuation_match, exact_match]
 
@@ -497,9 +673,10 @@ def test_write_json_outputs_expected_array(
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
 
-    assert len(payload) == 2
+    assert len(payload) == 3
     assert payload[0]["subject"] == "Weekly sync notes"
     assert payload[1]["body"] == "Hello\\\nworld\n\nRésumé"
+    assert payload[2]["subject"] == "Missing date"
 
 
 def test_run_extraction_raises_for_empty_mailbox(

@@ -124,9 +124,11 @@ names. For example:
 - `A1` matches the exact folder name `A1`
 - `1?.*` matches names like `1a.z`
 
-The glob controls which folders are scanned. A glob can match folders and still
-produce zero extracted emails if those folders have no messages in the selected
-date range after filtering.
+When `--folder-glob` is used, it replaces the default `INBOX` selection and
+scans only folders matched by the glob. Glob matching is case-insensitive, so
+`Inbox` matches Thunderbird's local `INBOX` file. Globs can also match
+Thunderbird parent folders that exist only as `.sbd` containers; use
+`--recursive-folders` to scan their child mailbox files.
 
 Extract multiple top-level folder families with shell-style patterns:
 
@@ -252,9 +254,10 @@ tool_timeout_sec = 300
 - `--days`
   Number of days back to include. Default: `7`
 - `--folder`
-  Thunderbird mbox filename to read. Default: `INBOX`
+  Thunderbird mbox filename to read. Default: `INBOX`. Ignored when
+  `--folder-glob` is provided.
 - `--folder-glob`
-  Shell-style pattern for matching top-level Thunderbird folders. May be repeated, for example `1*`, `A1`, or `1?.*`.
+  Shell-style pattern for matching top-level Thunderbird folders. May be repeated, for example `1*`, `A1`, or `1?.*`. Parent folders stored only as `.sbd` containers require `--recursive-folders`.
 - `--recursive-folders`
   Include descendant subfolders under the selected exact folder or matched glob folders
 - `--output`

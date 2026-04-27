@@ -60,6 +60,12 @@ def add_mailbox_message(
     mbox.close()
 
 
+def add_empty_account(profile_path: Path, account_name: str = "mail.backup.invalid") -> Path:
+    account_path = profile_path / "ImapMail" / account_name
+    account_path.mkdir(parents=True)
+    return account_path
+
+
 def parse_text_payload(result: list[object]) -> dict[str, object]:
     assert len(result) == 1
     text = getattr(result[0], "text")
@@ -76,6 +82,21 @@ def test_build_tools_exposes_account_discovery_and_fetch() -> None:
 def test_build_config_rejects_non_array_folder_globs() -> None:
     with pytest.raises(ValueError, match="folder_globs must be an array of strings"):
         mcp_app.build_config({"folder_globs": "1*"})
+
+
+def test_build_config_normalizes_folder_globs_and_recursive_selection() -> None:
+    config, output_format, write_to_file = mcp_app.build_config(
+        {
+            "format": "json",
+            "folder_globs": [" 1* ", "", " A1 "],
+            "recursive_folders": True,
+        }
+    )
+
+    assert output_format == "json"
+    assert write_to_file is False
+    assert config.mail_folder_globs == ("1*", "A1")
+    assert config.recursive_folders is True
 
 
 def test_list_accounts_tool_returns_structured_accounts(fixture_profile: Path) -> None:
@@ -96,6 +117,84 @@ def test_list_accounts_tool_returns_structured_accounts(fixture_profile: Path) -
             "account_path": str(fixture_profile / "ImapMail" / "mail.example.invalid"),
         }
     ]
+
+
+def test_list_accounts_tool_can_return_text_payload(fixture_profile: Path) -> None:
+    backup_account = add_empty_account(fixture_profile)
+
+    result = asyncio.run(
+        mcp_app.call_tool_impl(
+            "list_thunderbird_mail_accounts",
+            {"profile": str(fixture_profile), "format": "text"},
+        )
+    )
+
+    payload = parse_text_payload(result)
+    assert payload["format"] == "text"
+    assert payload["accounts"] == [
+        {
+            "account_name": "mail.backup.invalid",
+            "storage_root": "ImapMail",
+            "account_path": str(backup_account),
+        },
+        {
+            "account_name": "mail.example.invalid",
+            "storage_root": "ImapMail",
+            "account_path": str(fixture_profile / "ImapMail" / "mail.example.invalid"),
+        },
+    ]
+    assert "- mail.backup.invalid (ImapMail)" in payload["text"]
+    assert "- mail.example.invalid (ImapMail)" in payload["text"]
+
+
+def test_fetch_tool_uses_requested_account_when_multiple_accounts(
+    fixture_profile: Path,
+    frozen_now: None,
+) -> None:
+    backup_account = add_empty_account(fixture_profile)
+    add_mailbox_message(backup_account / "INBOX", subject="Backup account message")
+
+    result = asyncio.run(
+        mcp_app.call_tool_impl(
+            "fetch_thunderbird_local_emails",
+            {
+                "profile": str(fixture_profile),
+                "account": "mail.backup.invalid",
+                "format": "json",
+            },
+        )
+    )
+
+    payload = parse_text_payload(result)
+    assert payload["account_path"] == str(backup_account)
+    assert payload["mbox_paths"] == [str(backup_account / "INBOX")]
+    assert [email["subject"] for email in payload["emails"]] == ["Backup account message"]
+
+
+def test_fetch_tool_uses_folder_globs_without_default_inbox(
+    fixture_profile: Path,
+    frozen_now: None,
+) -> None:
+    account_path = fixture_profile / "ImapMail" / "mail.example.invalid"
+    top_level = account_path / "1Inbox"
+    add_mailbox_message(top_level, subject="Top-level active folder")
+
+    result = asyncio.run(
+        mcp_app.call_tool_impl(
+            "fetch_thunderbird_local_emails",
+            {
+                "profile": str(fixture_profile),
+                "format": "json",
+                "folder_globs": ["1*"],
+            },
+        )
+    )
+
+    payload = parse_text_payload(result)
+    subjects = [email["subject"] for email in payload["emails"]]
+    assert "Weekly sync notes" not in subjects
+    assert "Top-level active folder" in subjects
+    assert payload["mbox_paths"] == [str(top_level)]
 
 
 def test_fetch_tool_supports_recursive_folder_globs(
